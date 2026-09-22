@@ -1,2 +1,28 @@
+# Zig build artifacts
 .zig-cache/
 zig-out/
+
+# Node / TypeScript
+node_modules/
+packages/*/dist/
+*.tsbuildinfo
+
+# Model checkpoints and converted weights: never committed.
+models/*/
+!models/README.md
+artifacts/
+*.safetensors
+*.qw
+*.qw.part
+
+# Browser caches / test outputs
+.browser-cache/
+test-results/
+coverage/
+
+# Local scratch
+.scratchpad/
+*.log
+
+# mdBook build output
+docs/book/
