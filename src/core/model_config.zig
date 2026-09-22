@@ -14,6 +14,7 @@
 //! config-driven model description covers both.
 
 const std = @import("std");
+const dtype = @import("dtype.zig");
 const mel = @import("mel.zig");
 
 pub const magic = "QWCFG001";
@@ -32,6 +33,39 @@ pub const Architecture = enum(u32) {
     /// Qwen3 decoder with audio embeddings spliced in at placeholder positions.
     qwen3_asr = 1,
     _,
+};
+
+/// How the key/value cache stores one element.
+///
+/// The cache is read in full on every decoded token, so its width is a capacity and bandwidth
+/// decision before it is a fidelity one. `q8` is not a cache-specific format: it is the model's own
+/// weight format, so its packing, its WGSL mirrors, and the drift gate that keeps them agreeing
+/// already describe the cache too, and the kernels that read it are the ones that read weights.
+pub const CacheFormat = enum(u8) {
+    /// One f32 per element. The reference path and the default.
+    f32 = 0,
+    /// One signed 8-bit code per element, with an f16 scale per quantization group.
+    q8 = 1,
+    _,
+
+    /// The quantized format this maps onto, for the layout and kernel helpers.
+    pub fn toDtype(self: CacheFormat) dtype.Format {
+        return switch (self) {
+            .f32 => .f32,
+            .q8 => .q8,
+            _ => unreachable,
+        };
+    }
+
+    /// Bytes one element occupies in the code plane. A quantized format also carries a scale plane,
+    /// so budgeting from this alone undercounts; `quant.planeBytes` is the whole answer.
+    pub fn codeBytesPerElement(self: CacheFormat) u32 {
+        return switch (self) {
+            .f32 => @sizeOf(f32),
+            .q8 => 1,
+            _ => unreachable,
+        };
+    }
 };
 
 /// Post-convolution steps produced by running the audio tower's convolution
@@ -223,10 +257,6 @@ pub const Config = extern struct {
         return self.text_key_value_heads * self.text_head_dim;
     }
 
-    /// Bytes one layer's key or value cache needs for `positions` positions.
-    pub fn kvBytesPerLayer(self: *const Config, positions: u32, item_bytes: u32) u64 {
-        return @as(u64, self.textKeyValueElements()) * positions * item_bytes;
-    }
 
     pub fn validate(self: *const Config) Error!void {
         if (!std.mem.eql(u8, &self.magic, &magic_bytes)) return Error.BadMagic;

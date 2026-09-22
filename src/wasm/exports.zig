@@ -343,6 +343,25 @@ export fn qw_model_add_shard(handle: u32, shard_ptr: u32, shard_len: u32) i32 {
 ///
 /// Returns once the model is usable. A failure releases the arena, so a model
 /// that does not fit leaves no partial allocation behind and the call may be
+/// Chooses the key/value cache width the next `qw_model_finish` loads.
+///
+/// The cache is allocated during the load, so this is refused once a model exists: a format chosen
+/// afterwards would describe a model nobody built. `qw_model_requirements` reports what the chosen
+/// width costs, which is how a caller budgets for an instance whose memory is capped — the cache is
+/// a quarter of its f32 size at `q8` and decodes at the same speed.
+export fn qw_model_set_cache_format(handle: u32, format: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const requested = std.enums.fromInt(abi.CacheFormat, format) orelse
+        return abi.Status.invalid_argument.code();
+    const chosen: qw.model_config.CacheFormat = switch (requested) {
+        .full_precision => .f32,
+        .q8 => .q8,
+        else => return abi.Status.invalid_argument.code(),
+    };
+    model.setCacheFormat(chosen) catch return abi.Status.invalid_state.code();
+    return abi.Status.ok.code();
+}
+
 /// retried after the caller removes a shard or supplies a smaller budget.
 export fn qw_model_finish(handle: u32, config_ptr: u32, config_len: u32) i32 {
     if (requireInstance(handle)) |status| return status;

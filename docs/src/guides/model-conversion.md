@@ -63,10 +63,15 @@ than both q5 and q8 on the same clip: the decoder is bandwidth-bound, so three t
 costs more than the unpacking arithmetic saves. Per-run numbers are in the metrics records described
 in [Performance](../development/performance.md).
 
-The key/value cache is the other half of the memory budget, and it is not quantized yet: 8192
-positions cost 1.79 GiB in f32 for both 0.6B and 1.7B, since their text configurations share the same
-layer count, head counts, and head width. That cache, not the weights, is what keeps a 1.7B model out
-of a browser's linear memory today — see [Project status](../status.md).
+The key/value cache is the other half of the memory budget, and it is quantized with the same
+machinery as the weights: `--cache q8` stores one signed byte per element with an f16 scale per group
+of 64, which is 462 MiB at 8192 positions instead of 1792 MiB for both 0.6B and 1.7B — their text
+configurations share a layer count, head counts, and head width. Measured on the same clip through the
+same binary, the f32 and q8 caches decode at the same speed (1.49 and 1.55 tokens per second) and
+produce the same ten token ids, so the smaller cache is a capacity win rather than a trade. Through the ABI the
+width is chosen with `qw_model_set_cache_format` before the load, which is what makes the choice
+visible in `qw_model_requirements`; the browser-side SDK does not call it yet — see
+[Project status](../status.md).
 
 ## Conversion stages
 

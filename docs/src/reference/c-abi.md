@@ -33,6 +33,11 @@ Conceptual early exports include `qw_version`, `qw_init`, `qw_deinit`, `qw_alloc
 `qw_decode_step`, `qw_decode_end`, and `qw_token_to_text`. These names are not normative until the
 header lands.
 
+A family grows in place where it can. `qw_model_set_cache_format` was added to the model family after
+the family was in use and needed no version bump: a caller that never calls it gets the behavior it
+already had, and the width it chooses is reported back through `qw_model_requirements` rather than
+assumed. It is refused once a model is loaded, because the load is what allocates the cache.
+
 ## Ownership
 
 Each function documents who owns every input and output, how long borrowed bytes remain valid, and

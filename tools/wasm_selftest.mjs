@@ -62,7 +62,7 @@ function equal(actual, expected, description) {
 
 const modulePath = process.argv[2];
 if (!modulePath) {
-    console.error("usage: node tools/wasm_selftest.mjs <module.wasm>");
+    console.error("usage: node tools/wasm_selftest.mjs <module.wasm> [model dir]");
     process.exit(2);
 }
 
@@ -106,6 +106,7 @@ const required = [
     "qw_model_begin",
     "qw_model_add_shard",
     "qw_model_finish",
+    "qw_model_set_cache_format",
     "qw_model_requirements",
     "qw_decode_begin",
     "qw_decode_step",
@@ -654,6 +655,56 @@ function exerciseModel(modelDir) {
         `scratch ${requirements.scratchBytes} B, total ${requirements.totalBytes} B ` +
         `(${(requirements.totalBytes / 2 ** 30).toFixed(3)} GiB), positions ` +
         `${requirements.maxPositions}, audio frames ${requirements.maxAudioFrames}`,
+    );
+
+    // The cache width is chosen before a load, and the requirements say what it costs. The exact
+    // plane arithmetic belongs to the core and is tested there; the contract here is that an unknown
+    // format is refused, that a chosen format cannot change under a loaded model, and that the choice
+    // is what the reported bytes follow.
+    const cacheBytesF32 = requirements.cacheBytes;
+    equal(
+        e.qw_model_set_cache_format(handle, 7),
+        STATUS.invalidArgument,
+        "an unknown cache format is refused",
+    );
+    equal(
+        e.qw_model_set_cache_format(handle, 1),
+        STATUS.invalidState,
+        "the cache format cannot change once a model is loaded",
+    );
+    equal(e.qw_model_begin(handle), STATUS.ok, "begin releases the loaded model");
+    for (const [index, ptr] of shardPtrs.entries()) {
+        equal(
+            e.qw_model_add_shard(handle, ptr, shardBuffers[index].length),
+            STATUS.ok,
+            `shard ${index} accepted for the q8 load`,
+        );
+    }
+    equal(e.qw_model_set_cache_format(handle, 1), STATUS.ok, "q8 is accepted before a load");
+    equal(
+        e.qw_model_finish(handle, configPtr, config.length),
+        STATUS.ok,
+        "the model loads with a q8 cache",
+    );
+    equal(e.qw_model_requirements(handle, statePtr), STATUS.ok, "requirements for the q8 model");
+    // A fresh view: loading the q8 model can grow the instance's memory, and a view taken before a
+    // growth is detached. The configuration numbers above are already plain values, so they survive.
+    const q8View = new DataView(e.memory.buffer, statePtr, 48);
+    const cacheBytesQ8 = Number(q8View.getBigUint64(8, true));
+    const totalBytesQ8 = Number(q8View.getBigUint64(24, true));
+    check(
+        cacheBytesQ8 < cacheBytesF32 / 3,
+        "a q8 cache is under a third of the f32 one",
+        `${cacheBytesQ8} vs ${cacheBytesF32}`,
+    );
+    check(
+        cacheBytesQ8 >= layers * keyValueWidth * maxPositions,
+        "a q8 cache is at least one byte per element",
+        `${cacheBytesQ8}`,
+    );
+    console.log(
+        `q8 cache: ${cacheBytesQ8} B (${(cacheBytesQ8 / 2 ** 20).toFixed(1)} MiB) against ` +
+        `${cacheBytesF32} B f32, total ${(totalBytesQ8 / 2 ** 30).toFixed(3)} GiB`,
     );
 
     // The vocabulary, so the prompt can be built and ids detokenized. The table carries its own

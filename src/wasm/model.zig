@@ -114,6 +114,9 @@ pub const Model = struct {
 
     model: ?*model_mod.Model = null,
     decoder: ?*decoder_mod.Decoder = null,
+    /// Width the next `finish` loads the key/value cache at. Chosen through the ABI before the load,
+    /// because the load is what allocates it.
+    cache_format: model_config.CacheFormat = .f32,
     /// Prompt tokens for one utterance, `prompt.tokenCount(maxSteps)` long.
     prompt_tokens: []u32 = &.{},
     /// Token ids this utterance produced, `config.max_decode_tokens` long.
@@ -174,6 +177,16 @@ pub const Model = struct {
         assert(self.shard_count <= shard_count_max);
     }
 
+    /// Chooses the key/value cache width the next `finish` uses.
+    ///
+    /// Refused once a model is loaded: the cache is allocated during the load, so a format that
+    /// arrived afterwards would describe a model nobody built.
+    pub fn setCacheFormat(self: *Model, format: model_config.CacheFormat) Error!void {
+        if (self.state != .ready) return Error.InvalidState;
+        if (self.shard_count == 0) return Error.InvalidState;
+        self.cache_format = format;
+    }
+
     /// Resolves every tensor the architecture requires and prepares the decoder.
     ///
     /// This is where a model either becomes usable or fails cleanly: the
@@ -199,7 +212,7 @@ pub const Model = struct {
         for (self.shards[0..self.shard_count], 0..) |*file, index| files[index] = file;
 
         const loaded = try arena.create(model_mod.Model);
-        loaded.* = try model_mod.Model.load(arena, config.*, files[0..self.shard_count]);
+        loaded.* = try model_mod.Model.loadWithCache(arena, config.*, files[0..self.shard_count], self.cache_format);
 
         const decoder = try arena.create(decoder_mod.Decoder);
         decoder.* = decoder_mod.Decoder.init(loaded);

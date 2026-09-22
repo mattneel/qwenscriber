@@ -191,13 +191,25 @@ pub const Scratch = struct {
     /// Rotary tables, `max_positions x head_dim/2`.
     rope_cos: []f32,
     rope_sin: []f32,
-    /// Key/value cache, `positions x key_value_width`, per layer.
+    /// Key/value cache, `positions x key_value_width`, per layer. Exactly one of the two pairs is
+    /// allocated: the f32 pair, or the quantized pair, whichever the model was loaded for. The
+    /// unused pair is empty rather than absent, so nothing has to be nullable.
     cache_keys: []f32,
     cache_values: []f32,
+    /// The same cache in the model's own quantized layout: one plane per layer, scales then codes,
+    /// as `quant.planeBytes` describes.
+    cache_keys_q8: []u8,
+    cache_values_q8: []u8,
 };
 
 pub const Model = struct {
     config: model_config.Config,
+
+    /// Width of the key/value cache this model holds. The cache is read in full on every decoded
+    /// token, so this decides whether a model fits a bounded instance at all; `cacheBytes` reports
+    /// what it costs, and the ABI carries that figure to the caller so a budget is computed from
+    /// the format actually in use rather than from the widest one possible.
+    cache_format: model_config.CacheFormat = .f32,
 
     conv1_weight: []const u16,
     conv1_bias: []const f32,
@@ -237,10 +249,14 @@ pub const Model = struct {
         return self.config.textKeyValueElements();
     }
 
-    /// Bytes of key/value cache the model holds.
+    /// Bytes of key/value cache the model holds, in the format it was loaded for.
     pub fn cacheBytes(self: *const Model) u64 {
-        return 2 * @as(u64, self.config.text_layers) * self.kvWidth() *
-            self.config.max_positions * @sizeOf(f32);
+        const per_layer = quant.planeBytes(
+            self.cache_format.toDtype(),
+            self.config.max_positions,
+            self.kvWidth(),
+        );
+        return 2 * @as(u64, self.config.text_layers) * per_layer;
     }
 
     /// Bytes of scratch the model holds, *excluding* the key/value cache, which
@@ -255,12 +271,13 @@ pub const Model = struct {
         const info = @typeInfo(Scratch).@"struct";
         var total: u64 = 0;
         inline for (info.field_names, info.field_types) |field_name, field_type| {
-            // Every scratch buffer is an f32 slice, so summing lengths is a
-            // byte count with no per-buffer bookkeeping.
-            comptime std.debug.assert(field_type == []f32);
+            // Every scratch buffer is a slice, but not every one is f32: the quantized cache planes
+            // are bytes. The element size therefore comes from the field's own type rather than from
+            // an assumption, which is what keeps a byte plane from being counted as f32 words.
+            comptime std.debug.assert(@typeInfo(field_type) == .pointer);
             if (comptime isCacheBuffer(field_name)) continue;
-            const buffer: []f32 = @field(self.scratch, field_name);
-            total += @as(u64, buffer.len) * @sizeOf(f32);
+            const buffer = @field(self.scratch, field_name);
+            total += @as(u64, buffer.len) * @sizeOf(std.meta.Elem(field_type));
         }
         return total;
     }
@@ -271,7 +288,7 @@ pub const Model = struct {
     /// scratch report, which is the failure the old subtraction-based version was
     /// trying to catch from the other end.
     fn isCacheBuffer(comptime field_name: []const u8) bool {
-        const cache_fields = [_][]const u8{ "cache_keys", "cache_values" };
+        const cache_fields = [_][]const u8{ "cache_keys", "cache_values", "cache_keys_q8", "cache_values_q8" };
         inline for (cache_fields) |name| {
             if (!@hasField(Scratch, name)) {
                 @compileError("a cache buffer was renamed: update scratchBytes' exclusion list");
@@ -286,10 +303,21 @@ pub const Model = struct {
     /// `shards` are expected to be the model's shards in any order; a tensor may
     /// live in any of them. Duplicates are an error rather than a silent
     /// last-wins, because they mean the converter emitted an ambiguous model.
+    /// Loads a model with the reference-width f32 key/value cache.
     pub fn load(
         arena: std.mem.Allocator,
         config: model_config.Config,
         shards: []const *const container.File,
+    ) Error!Model {
+        return loadWithCache(arena, config, shards, .f32);
+    }
+
+    /// Loads a model whose key/value cache stores elements in `cache_format`.
+    pub fn loadWithCache(
+        arena: std.mem.Allocator,
+        config: model_config.Config,
+        shards: []const *const container.File,
+        cache_format: model_config.CacheFormat,
     ) Error!Model {
         try validateCapacity(&config);
 
@@ -365,9 +393,10 @@ pub const Model = struct {
         else
             model.embed_tokens;
 
+        model.cache_format = cache_format;
         model.audio_layers = try loadAudioLayers(arena, &config, bindings);
         model.decoder_layers = try loadDecoderLayers(arena, &config, bindings);
-        model.scratch = try allocateScratch(arena, &config);
+        model.scratch = try allocateScratch(arena, &config, cache_format);
         try kernels.buildRopeTables(
             model.scratch.rope_cos,
             model.scratch.rope_sin,
@@ -389,6 +418,16 @@ pub const Model = struct {
         config: model_config.Config,
         shard_bytes: []const []align(16) const u8,
     ) Error!Model {
+        return loadFromShardBytesWithCache(arena, config, shard_bytes, .f32);
+    }
+
+    /// Parses shards and loads them into a model with the named cache format.
+    pub fn loadFromShardBytesWithCache(
+        arena: std.mem.Allocator,
+        config: model_config.Config,
+        shard_bytes: []const []align(16) const u8,
+        cache_format: model_config.CacheFormat,
+    ) Error!Model {
         const files = arena.alloc(container.File, shard_bytes.len) catch return Error.OutOfMemory;
         const pointers = arena.alloc(*const container.File, shard_bytes.len) catch
             return Error.OutOfMemory;
@@ -400,7 +439,7 @@ pub const Model = struct {
             try files[index].verifyChecksum();
             pointers[index] = &files[index];
         }
-        return load(arena, config, pointers);
+        return loadWithCache(arena, config, pointers, cache_format);
     }
 
     /// Runs the audio tower and projector over a log-mel spectrogram.
@@ -969,10 +1008,23 @@ fn validateCapacity(config: *const model_config.Config) Error!void {
     if (config.max_positions == 0) return Error.CapacityExceeded;
 }
 
-fn allocateScratch(arena: std.mem.Allocator, config: *const model_config.Config) Error!Scratch {
+fn allocateScratch(
+    arena: std.mem.Allocator,
+    config: *const model_config.Config,
+    cache_format: model_config.CacheFormat,
+) Error!Scratch {
     const d_model = config.audio_d_model;
     const downsample = config.audio_downsample_hidden_size;
     const ffn_dim = config.audio_ffn_dim;
+    // The f32 cache is counted in elements and the quantized cache in plane bytes, and each pair is
+    // zero-length when the other format is in use.
+    const cache_elements = @as(usize, config.text_layers) * config.max_positions *
+        config.textKeyValueElements();
+    const cache_plane_bytes = @as(u64, config.text_layers) * quant.planeBytes(
+        cache_format.toDtype(),
+        config.max_positions,
+        config.textKeyValueElements(),
+    );
     const hidden = config.text_hidden_size;
     const max_steps = config.packedStepCount(mel.capacity_frames);
     const window_steps = (config.audio_n_window_infer / config.audioChunkFrames()) *
@@ -1020,16 +1072,18 @@ fn allocateScratch(arena: std.mem.Allocator, config: *const model_config.Config)
         .logits = try allocate(arena, f32, config.vocab_size),
         .rope_cos = try allocate(arena, f32, @as(usize, config.max_positions) * half_head),
         .rope_sin = try allocate(arena, f32, @as(usize, config.max_positions) * half_head),
-        .cache_keys = try allocate(
-            arena,
-            f32,
-            @as(usize, config.text_layers) * config.max_positions * config.textKeyValueElements(),
-        ),
-        .cache_values = try allocate(
-            arena,
-            f32,
-            @as(usize, config.text_layers) * config.max_positions * config.textKeyValueElements(),
-        ),
+        // Exactly one cache pair is allocated: the other stays empty, so a reader cannot mistake
+        // a format for "unset" and the byte budget is the one `cacheBytes` reports.
+        .cache_keys = if (cache_format == .f32) try allocate(arena, f32, cache_elements) else &.{},
+        .cache_values = if (cache_format == .f32) try allocate(arena, f32, cache_elements) else &.{},
+        .cache_keys_q8 = if (cache_format == .f32)
+            &.{}
+        else
+            try allocate(arena, u8, cache_plane_bytes),
+        .cache_values_q8 = if (cache_format == .f32)
+            &.{}
+        else
+            try allocate(arena, u8, cache_plane_bytes),
     };
 }
 
@@ -1073,6 +1127,9 @@ test "scratch bytes account for every populated buffer, without the cache" {
     var cache: [32]f32 = undefined;
     model.scratch.cache_keys = &cache;
     model.scratch.cache_values = &cache;
+    // A bare `Model` is all `undefined`, and `cacheBytes` reads the format: leaving it unset is a
+    // programmer error the format's `unreachable` arm reports rather than a silent answer.
+    model.cache_format = .f32;
     try std.testing.expectEqual(@as(u64, 44), model.scratchBytes());
     try std.testing.expectEqual(@as(u64, 256), model.cacheBytes());
 }

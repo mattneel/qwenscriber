@@ -27,6 +27,24 @@ pub fn packVersion(comptime version_major: u32, comptime version_minor: u32) u32
 
 pub const version: u32 = packVersion(major, minor);
 
+/// Key/value cache widths a caller may ask for, as `qw_model_set_cache_format` takes them.
+///
+/// The cache is read in full on every decoded token, so its width decides whether a model fits a
+/// bounded instance: `q8` is a quarter of the f32 size and decodes at the same speed. The variants
+/// are not named `f32` and `q8`: a declaration may not shadow a primitive type name, which Zig
+/// refuses outright.
+pub const CacheFormat = enum(u32) {
+    /// One f32 per element. The reference path, and what a model gets by default.
+    full_precision = 0,
+    /// One signed 8-bit code per element, with an f16 scale per quantization group.
+    q8 = 1,
+    _,
+
+    pub fn code(self: CacheFormat) u32 {
+        return @intFromEnum(self);
+    }
+};
+
 /// Status codes. Zero is success; every failure is a distinct negative value so
 /// JavaScript can map them to typed errors without parsing text.
 pub const Status = enum(i32) {

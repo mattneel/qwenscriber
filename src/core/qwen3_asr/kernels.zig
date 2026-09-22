@@ -626,6 +626,215 @@ pub fn decodeAttentionStep(
     }
 }
 
+/// Adds `codes` times `query_row` over the first `groups` groups, dequantizing as it goes.
+///
+/// The dequantization is fused into the dot product rather than writing decoded values to a scratch
+/// and reading them back: the first version did that, and it was four times slower than the f32 path
+/// it replaces, because the extra store, load, and per-element conversion cost more than the bytes it
+/// saved. `lanes` values are converted and multiplied at a time, which is the shape the f32 kernels
+/// already use, and the group's scale is applied once per group instead of once per element.
+fn q8GroupDot(
+    query_row: []const f32,
+    codes: []const u8,
+    scales: []const u8,
+    first_group: usize,
+    groups: u32,
+) f32 {
+    comptime std.debug.assert(quant.group_size % lanes == 0);
+    const bias: Vector = @splat(@floatFromInt(quant.bias(.q8)));
+    var total: f32 = 0;
+    var group_index: u32 = 0;
+    while (group_index < groups) : (group_index += 1) {
+        const base = @as(usize, group_index) * quant.group_size;
+        const scale = half_float.fromF16(quant.readF16Le(scales, first_group + group_index));
+        var inner: Vector = @splat(0.0);
+        var index: usize = 0;
+        while (index < quant.group_size) : (index += lanes) {
+            const codes_vector: @Vector(lanes, u8) = codes[base + index ..][0..lanes].*;
+            const query_vector: Vector = query_row[base + index ..][0..lanes].*;
+            const centred = @as(Vector, @floatFromInt(codes_vector)) - bias;
+            inner += centred * query_vector;
+        }
+        total += @reduce(.Add, inner) * scale;
+    }
+    return total;
+}
+
+/// Adds `weight` times `codes` onto `out_row`, dequantizing as it goes, under the same reasoning as
+/// `q8GroupDot`.
+fn q8GroupAccumulate(
+    out_row: []f32,
+    codes: []const u8,
+    scales: []const u8,
+    first_group: usize,
+    groups: u32,
+    weight: f32,
+) void {
+    comptime std.debug.assert(quant.group_size % lanes == 0);
+    const bias: Vector = @splat(@floatFromInt(quant.bias(.q8)));
+    var group_index: u32 = 0;
+    while (group_index < groups) : (group_index += 1) {
+        const base = @as(usize, group_index) * quant.group_size;
+        const scale = half_float.fromF16(quant.readF16Le(scales, first_group + group_index));
+        const scaled_weight: Vector = @splat(scale * weight);
+        var index: usize = 0;
+        while (index < quant.group_size) : (index += lanes) {
+            const codes_vector: @Vector(lanes, u8) = codes[base + index ..][0..lanes].*;
+            const centred = @as(Vector, @floatFromInt(codes_vector)) - bias;
+            const current: Vector = out_row[base + index ..][0..lanes].*;
+            out_row[base + index ..][0..lanes].* = current + centred * scaled_weight;
+        }
+    }
+}
+
+/// One decoder attention step over a `q8` key/value cache.
+///
+/// The cache is stored in the model's own weight format — one byte per element, an f16 scale per
+/// group — so this reads it with the same decoder and the same layout as a quantized weight, and a
+/// kernel that walks it group by group keeps the dequantized values in cache instead of writing an
+/// f32 copy back out. `cached` rows of `key_value_heads * head_dim` elements are read from each of
+/// the two planes; `scores` must hold at least `cached` values.
+pub fn decodeAttentionStepQ8(
+    out: []f32,
+    query: []const f32,
+    keys_scales: []const u8,
+    keys_codes: []const u8,
+    values_scales: []const u8,
+    values_codes: []const u8,
+    cached: u32,
+    heads: u32,
+    key_value_heads: u32,
+    head_dim: u32,
+    scores: []f32,
+) Error!void {
+    const query_width = heads * head_dim;
+    const key_value_width = key_value_heads * head_dim;
+    if (query.len != query_width) return Error.ShapeMismatch;
+    if (out.len != query_width) return Error.ShapeMismatch;
+    if (head_dim % quant.group_size != 0) return Error.ShapeMismatch;
+    if (heads % key_value_heads != 0) return Error.ShapeMismatch;
+    if (scores.len < cached) return Error.ShapeMismatch;
+
+    const groups_per_row = key_value_width / quant.group_size;
+    const scale_bytes = @as(usize, cached) * groups_per_row * quant.q4_scale_bytes_per_group;
+    if (keys_scales.len < scale_bytes) return Error.ShapeMismatch;
+    if (values_scales.len < scale_bytes) return Error.ShapeMismatch;
+    if (keys_codes.len < @as(usize, cached) * key_value_width) return Error.ShapeMismatch;
+    if (values_codes.len < @as(usize, cached) * key_value_width) return Error.ShapeMismatch;
+
+    const groups = heads / key_value_heads;
+    const groups_per_head = head_dim / quant.group_size;
+    const scaling = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    var head: u32 = 0;
+    while (head < heads) : (head += 1) {
+        const head_query = query[head * head_dim ..][0..head_dim];
+        const key_value_head = head / groups;
+        const head_group = @as(usize, key_value_head * head_dim) / quant.group_size;
+
+        var position: u32 = 0;
+        while (position < cached) : (position += 1) {
+            const row_group = @as(usize, position) * groups_per_row + head_group;
+            const codes = keys_codes[@as(usize, position) * key_value_width +
+                key_value_head * head_dim ..];
+            scores[position] = scaling * q8GroupDot(
+                head_query,
+                codes,
+                keys_scales,
+                row_group,
+                groups_per_head,
+            );
+        }
+        math.softmaxInPlace(scores[0..cached]);
+
+        const head_out = out[head * head_dim ..][0..head_dim];
+        @memset(head_out, 0.0);
+        position = 0;
+        while (position < cached) : (position += 1) {
+            const row_group = @as(usize, position) * groups_per_row + head_group;
+            const codes = values_codes[@as(usize, position) * key_value_width +
+                key_value_head * head_dim ..];
+            q8GroupAccumulate(
+                head_out,
+                codes,
+                values_scales,
+                row_group,
+                groups_per_head,
+                scores[position],
+            );
+        }
+    }
+}
+
+test "the quantized cache agrees with the f32 cache it replaces" {
+    // Shaped like the model: four query heads sharing two key/value heads, and a head width that is
+    // one whole quantization group — the kernel refuses a head that is not, because a head's codes
+    // and its scales have to begin on the same boundary for the layout to mean anything.
+    const head_dim = quant.group_size;
+    const key_value_heads = 2;
+    const heads = 4;
+    const cached = 5;
+    const key_value_width = key_value_heads * head_dim;
+    const groups_per_row = key_value_width / quant.group_size;
+    const scale_bytes = groups_per_row * quant.q4_scale_bytes_per_group;
+
+    var keys: [cached * key_value_width]f32 = undefined;
+    var values: [cached * key_value_width]f32 = undefined;
+    var query: [heads * head_dim]f32 = undefined;
+    var codes_keys: [cached * key_value_width]u8 = undefined;
+    var codes_values: [cached * key_value_width]u8 = undefined;
+    var scales_keys: [cached * scale_bytes]u8 = undefined;
+    var scales_values: [cached * scale_bytes]u8 = undefined;
+
+    // Deterministic, and spanning several quantization steps so a wrong scale or a wrong group
+    // boundary shows up as a difference rather than as noise.
+    var state: u32 = 7;
+    for (&keys) |*value| {
+        state = state *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((state >> 9) % 2001)) - 1000)) / 200.0;
+    }
+    for (&values) |*value| {
+        state = state *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((state >> 9) % 2001)) - 1000)) / 400.0;
+    }
+    for (&query) |*value| {
+        state = state *% 1664525 +% 1013904223;
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((state >> 9) % 2001)) - 1000)) / 500.0;
+    }
+
+    for (0..cached) |position| {
+        const key_row = keys[position * key_value_width ..][0..key_value_width];
+        const value_row = values[position * key_value_width ..][0..key_value_width];
+        quant.quantizeRow(.q8, key_row, scales_keys[position * scale_bytes ..][0..scale_bytes], codes_keys[position * key_value_width ..][0..key_value_width]);
+        quant.quantizeRow(.q8, value_row, scales_values[position * scale_bytes ..][0..scale_bytes], codes_values[position * key_value_width ..][0..key_value_width]);
+    }
+
+    var scores: [cached]f32 = undefined;
+    var exact: [heads * head_dim]f32 = undefined;
+    var quantized: [heads * head_dim]f32 = undefined;
+    try decodeAttentionStep(&exact, &query, &keys, &values, cached, heads, key_value_heads, head_dim, &scores);
+    try decodeAttentionStepQ8(
+        &quantized,
+        &query,
+        &scales_keys,
+        &codes_keys,
+        &scales_values,
+        &codes_values,
+        cached,
+        heads,
+        key_value_heads,
+        head_dim,
+        &scores,
+    );
+
+    // One quantization step is 1/256 of a group's range, and attention averages a head's worth of
+    // them, so the difference this test tolerates is the format's own error rather than a claim
+    // about the model.
+    for (exact, quantized) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected, actual, 0.05);
+    }
+}
+
 const assert = std.debug.assert;
 
 test "a linear layer multiplies a batch of tokens" {

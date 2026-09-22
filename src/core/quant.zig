@@ -175,6 +175,21 @@ pub fn planeLayout(
     };
 }
 
+/// Bytes one plane of a key/value cache occupies at `positions` rows of `cols` elements.
+///
+/// The cache is a quantized tensor like any other here: same group size, same two-plane layout, same
+/// `bias`, which is what lets one set of kernels and one drift gate describe both the weights and the
+/// cache. `positions` is the row count because the cache is row-major by position.
+pub fn planeBytes(format: dtype.Format, positions: u32, cols: u32) u64 {
+    const groups = @as(u64, positions) * (@as(u64, cols) / group_size);
+    return switch (format) {
+        .f32 => @as(u64, positions) * cols * @sizeOf(f32),
+        .q4, .q5, .q8 => groups * q4_scale_bytes_per_group +
+            groups * dataBytesPerGroup(format),
+        else => unreachable,
+    };
+}
+
 /// Quantizes one row of `cols` values into preallocated planes.
 ///
 /// A row of all zeros stores scale 0 and zero codes, which decodes back to
@@ -382,6 +397,27 @@ test "group count requires whole groups" {
     try std.testing.expectEqual(@as(u32, 0), try groupCount(0, 1024));
     try std.testing.expectError(Error.RowNotGroupAligned, groupCount(1, 100));
     try std.testing.expectError(Error.RowNotGroupAligned, groupCount(1, 1));
+}
+
+test "a quantized key/value cache costs a quarter of the f32 one" {
+    // The geometry both released models share: 28 layers, 8 key/value heads of 128 elements, and
+    // 8192 positions. This is the number that decides whether 1.7B fits a 2 GiB instance.
+    const layers = 28;
+    const key_value_width = 8 * 128;
+    const positions = 8192;
+    const f32_bytes = 2 * layers * planeBytes(.f32, positions, key_value_width);
+    const q8_bytes = 2 * layers * planeBytes(.q8, positions, key_value_width);
+
+    try std.testing.expectEqual(@as(u64, 1879048192), f32_bytes); // 1.75 GiB, the figure the ABI reports
+    // One byte per element, plus the scale plane: two bytes per group of `group_size` elements. The
+    // expectation is derived from the constant rather than written out, because a group size that
+    // changes is a layout change and this test should follow it rather than fail mysteriously.
+    const groups = key_value_width / group_size;
+    try std.testing.expectEqual(
+        @as(u64, positions) * (key_value_width + groups * q4_scale_bytes_per_group),
+        q8_bytes / (2 * layers),
+    );
+    try std.testing.expect(q8_bytes < f32_bytes / 3);
 }
 
 test "plane layout aligns both planes" {

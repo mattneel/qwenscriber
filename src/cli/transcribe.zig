@@ -12,6 +12,7 @@
 //!
 //!     qwenscriber-transcribe --model <model dir> --audio <wav> [--max-tokens N]
 //!                            [--dump <dir>] [--dump-logits] [--metrics <path>]
+//!                            [--cache f32|q8]
 
 const std = @import("std");
 const Io = std.Io;
@@ -76,14 +77,21 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    var model = try qw.qwen3_asr.model.Model.loadFromShardBytes(
+    const cache_format = cacheFormat(options.cache) orelse {
+        try out.print("error: --cache {s} is not f32 or q8\n", .{options.cache});
+        try out.flush();
+        std.process.exit(2);
+    };
+    var model = try qw.qwen3_asr.model.Model.loadFromShardBytesWithCache(
         gpa,
         config.*,
         shard_bytes.items,
+        cache_format,
     );
     const load_ms = nowMs(io) - started;
-    try out.print("loaded in {d} ms, key/value cache {d} MiB\n", .{
+    try out.print("loaded in {d} ms, {s} key/value cache {d} MiB\n", .{
         load_ms,
+        options.cache,
         model.cacheBytes() / (1024 * 1024),
     });
 
@@ -289,6 +297,8 @@ const Options = struct {
     dump_logits: bool = false,
     /// Where to write the run's metrics record. Empty writes none.
     metrics_path: []const u8 = "",
+    /// Key/value cache width: `f32` (the reference) or `q8`.
+    cache: []const u8 = "f32",
     help: bool = false,
 
     fn parse(
@@ -319,6 +329,10 @@ const Options = struct {
                 self.dump_path = args[index];
             } else if (std.mem.eql(u8, arg, "--dump-logits")) {
                 self.dump_logits = true;
+            } else if (std.mem.eql(u8, arg, "--cache")) {
+                index += 1;
+                if (index >= args.len) return fail(out, "missing value for --cache");
+                self.cache = args[index];
             } else if (std.mem.eql(u8, arg, "--metrics")) {
                 index += 1;
                 if (index >= args.len) return fail(out, "missing value for --metrics");
@@ -354,9 +368,17 @@ fn printUsage(out: *Io.Writer) !void {
         \\  --dump <dir>        write intermediate tensors for reference comparison
         \\  --dump-logits       also write the first step's logits
         \\  --metrics <path>    write this run's measurements as a JSON record
+        \\  --cache <format>    key/value cache width: f32 (default) or q8
         \\  --help              show this message
         \\
     , .{});
+}
+
+/// The cache format a `--cache` value names, or null for a name this build does not know.
+fn cacheFormat(name: []const u8) ?qw.model_config.CacheFormat {
+    if (std.mem.eql(u8, name, "f32")) return .f32;
+    if (std.mem.eql(u8, name, "q8")) return .q8;
+    return null;
 }
 
 /// Writes intermediates in the `QWFIX001` container so a Python driver can
