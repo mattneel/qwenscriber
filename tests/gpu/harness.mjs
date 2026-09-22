@@ -282,6 +282,13 @@ function build_normalization_cases() {
     const argmax_values = ref.random_vector(argmax_count, 0x5eed_0014);
     argmax_values[777] = 4.0;
     argmax_values[333] = 4.0;
+    // Two rows of 128 values: four groups, so the scale plane holds two 32-bit words and the code
+    // plane four groups of 64 bytes. One group is all zeros, which must store a zero scale.
+    const quantize_rows = 2;
+    const quantize_cols = 128;
+    const quantize_values = ref.random_vector(quantize_rows * quantize_cols, 0x5eed_0015);
+    for (let index = 0; index < 64; index += 1) quantize_values[64 + index] = 0;
+    const quantize_data_offset = 16;
     const add_left = ref.random_vector(SHAPE.silu_count, 0x5eed_0010);
     const add_right = ref.random_vector(SHAPE.silu_count, 0x5eed_0011);
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
@@ -450,6 +457,44 @@ function build_normalization_cases() {
             ),
             tolerance: TOLERANCES.add_bias,
             detail: `target ${bias_rows}x${bias_cols}, bias ${bias_cols}, in place`,
+        },
+        {
+            name: "quantize_q8_group",
+            shader: "quantize_q8_group.wgsl",
+            entry_point: "quantize_q8_group_main",
+            workgroup: [64, 1, 1],
+            bindings: [
+                {
+                    // The two planes are separate buffers in this case, so both bases are zero. The
+                    // reference still carries the cache's alignment gap, which the expected value
+                    // above splices out.
+                    uniform: pack_uniform([quantize_rows, quantize_cols, 0, 0]),
+                },
+                { input: quantize_values },
+                // Two planes, each declared with its own length: the scale plane of `groups` f16
+                // values, then the code plane of `groups * 64` bytes.
+                { output_bytes: (quantize_rows * quantize_cols / 64) * 2 },
+                { output_bytes: quantize_rows * quantize_cols },
+            ],
+            dispatch: [quantize_cols / 64, quantize_rows, 1],
+            output_kind: "bytes",
+            // In binding order, with the alignment gap between the planes dropped: the comparison
+            // sees the scales followed by the codes, not the cache buffer's layout.
+            expected: (() => {
+                const planes = ref.quantize_q8_rows_reference(
+                    quantize_values,
+                    quantize_rows,
+                    quantize_cols,
+                    quantize_data_offset,
+                );
+                const scale_bytes = (quantize_rows * quantize_cols / 64) * 2;
+                const combined = new Uint8Array(scale_bytes + quantize_rows * quantize_cols);
+                combined.set(planes.subarray(0, scale_bytes), 0);
+                combined.set(planes.subarray(quantize_data_offset), scale_bytes);
+                return combined;
+            })(),
+            tolerance: TOLERANCES.add,
+            detail: `${quantize_rows}x${quantize_cols}, data offset ${quantize_data_offset}`,
         },
         {
             name: "argmax_f32",
@@ -800,8 +845,12 @@ function create_binding_buffer(device, binding) {
         device.queue.writeBuffer(buffer, 0, bytes);
         return buffer;
     }
+    // `output` counts elements; `output_bytes` is for a kernel whose result is a packing, where the
+    // case declares a byte length rather than a number of f32 values.
     const output = device.createBuffer({
-        size: align_up(binding.output * 4, 4),
+        size: binding.output_bytes === undefined
+            ? align_up(binding.output * 4, 4)
+            : align_up(binding.output_bytes, 4),
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
     // A kernel that reads and writes the same buffer -- an in-place bias add, a residual -- needs
@@ -846,12 +895,29 @@ export async function run_case(gpu, kernel_case, keep_values = false) {
         layout: pipeline.getBindGroupLayout(0),
         entries,
     });
-    const output_index = kernel_case.bindings.findIndex((binding) => binding.output !== undefined);
-    const output_bytes = kernel_case.expected.length * 4;
-    const readback = gpu.device.createBuffer({
-        size: align_up(output_bytes, 4),
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
+    // Every binding that declares itself an output is compared, in binding order: a kernel may write
+    // more than one plane, and the quantized cache append writes two. Each carries its own length --
+    // `output` in elements, `output_bytes` in bytes -- because two planes of one kernel are rarely
+    // the same size.
+    const element_bytes = kernel_case.output_kind === "bytes" ? 1 : (
+        kernel_case.output_kind === "u32" ? 4 : 4
+    );
+    const outputs = kernel_case.bindings
+        .map((binding, index) => ({
+            index,
+            bytes: binding.output_bytes !== undefined
+                ? binding.output_bytes
+                : binding.output === undefined
+                    ? 0
+                    : binding.output * element_bytes,
+        }))
+        .filter((output) => output.bytes > 0);
+    const readbacks = outputs.map((output) =>
+        gpu.device.createBuffer({
+            size: align_up(output.bytes, 4),
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        })
+    );
 
     const encoder = gpu.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
@@ -859,23 +925,33 @@ export async function run_case(gpu, kernel_case, keep_values = false) {
     pass.setBindGroup(0, bind_group);
     pass.dispatchWorkgroups(...kernel_case.dispatch);
     pass.end();
-    encoder.copyBufferToBuffer(buffers[output_index], 0, readback, 0, output_bytes);
+    outputs.forEach((output, position) => {
+        encoder.copyBufferToBuffer(buffers[output.index], 0, readbacks[position], 0, output.bytes);
+    });
     gpu.device.queue.submit([encoder.finish()]);
 
-    await readback.mapAsync(GPUMapMode.READ);
-    // A copy out of the mapped range, so the comparison never touches memory the
-    // driver is free to invalidate on unmap. An index-producing kernel declares its output as u32:
-    // reading a bit pattern as f32 would compare a denormal against an index.
-    const mapped = readback.getMappedRange().slice(0);
-    const actual = kernel_case.output_kind === "u32"
-        ? new Uint32Array(mapped)
-        : new Float32Array(mapped);
-    readback.unmap();
+    await Promise.all(readbacks.map((buffer) => buffer.mapAsync(GPUMapMode.READ)));
+    // Copies out of the mapped ranges, so the comparison never touches memory the driver is free to
+    // invalidate on unmap. `u32` is for an index or an id, `bytes` for a kernel that writes a packing
+    // (where reading the bytes as f32 would compare bit patterns), and f32 for everything else.
+    const Actual = kernel_case.output_kind === "u32"
+        ? Uint32Array
+        : kernel_case.output_kind === "bytes"
+            ? Uint8Array
+            : Float32Array;
+    const actual = new Actual(kernel_case.expected.length);
+    let written = 0;
+    readbacks.forEach((buffer, position) => {
+        const view = new Actual(buffer.getMappedRange().slice(0));
+        actual.set(view, written);
+        written += view.length;
+        buffer.unmap();
+        buffer.destroy();
+    });
 
     const internal_error = await gpu.device.popErrorScope();
     const validation_error = await gpu.device.popErrorScope();
     for (const buffer of buffers) buffer.destroy();
-    readback.destroy();
 
     if (internal_error !== null || validation_error !== null) {
         row.status = "error";

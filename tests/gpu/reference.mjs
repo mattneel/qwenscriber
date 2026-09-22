@@ -523,6 +523,36 @@ export function transpose_reference(input, rows, cols) {
     return out;
 }
 
+// The q8 cache planes for one batch of rows, mirroring `quantizeRow` in `src/core/quant.zig`.
+//
+// The scale is stored as f16 and the codes are computed against that *stored* value, not the f32
+// quotient, so a group can never decode above its true maximum. Rounding is half away from zero.
+export function quantize_q8_rows_reference(values, rows, cols, data_offset_bytes) {
+    const groups_per_row = cols / GROUP_SIZE;
+    const group_count = rows * groups_per_row;
+    const bytes = new Uint8Array(data_offset_bytes + group_count * GROUP_SIZE);
+    for (let group = 0; group < group_count; group += 1) {
+        let max_abs = 0;
+        for (let index = 0; index < GROUP_SIZE; index += 1) {
+            max_abs = Math.max(max_abs, Math.abs(values[group * GROUP_SIZE + index]));
+        }
+        const scale_bits = to_f16_bits(max_abs / 128);
+        const scale = from_f16_bits(scale_bits);
+        bytes[group * 2] = scale_bits & 0xff;
+        bytes[group * 2 + 1] = (scale_bits >>> 8) & 0xff;
+        for (let index = 0; index < GROUP_SIZE; index += 1) {
+            const value = values[group * GROUP_SIZE + index];
+            const scaled = scale === 0 ? 0 : value / scale;
+            const rounded = scale === 0
+                ? 0
+                : (scaled >= 0 ? Math.floor(scaled + 0.5) : Math.ceil(scaled - 0.5));
+            const clamped = Math.max(-128, Math.min(127, rounded));
+            bytes[data_offset_bytes + group * GROUP_SIZE + index] = clamped + 128;
+        }
+    }
+    return bytes;
+}
+
 export function fnv1a_64(byte_arrays) {
     let hash = FNV1A_64_OFFSET_BASIS;
     for (const bytes of byte_arrays) {
