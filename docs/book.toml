@@ -1,0 +1,20 @@
+[book]
+title = "Qwenscriber"
+description = "Local-first Qwen3-ASR inference with Zig, WebAssembly SIMD, WebGPU/WGSL, and TypeScript"
+authors = ["Qwenscriber contributors"]
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/qwenscriber/"
+git-repository-url = "https://github.com/mattneel/qwenscriber"
+edit-url-template = "https://github.com/mattneel/qwenscriber/edit/main/docs/{path}"
+no-section-label = true
+default-theme = "navy"
+preferred-dark-theme = "navy"
+

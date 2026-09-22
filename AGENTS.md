@@ -1,1001 +1,211 @@
 # AGENTS.md
 
-## Qwenscriber
+This file is the operating contract for humans and coding agents working in this repository.
+Read it before changing code. The complete style rationale lives in
+[`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md).
 
-Qwenscriber is a small, high-performance, local-first speech-to-text runtime for
-Qwen3-ASR.
+## Project truth
 
-The bring-up target is Qwen3-ASR 0.6B.
+Qwenscriber is a small, high-performance, local-first runtime for Qwen3-ASR.
 
-The primary production target is Qwen3-ASR 1.7B running entirely client-side in
-modern browsers using:
+- Qwen3-ASR 0.6B is the bring-up target.
+- Qwen3-ASR 1.7B is the production architecture target.
+- Browser inference is client-side. No server or cloud transcription API is required.
+- The intended stack is Zig + WASM SIMD + WebGPU/WGSL + TypeScript.
+- The runtime owns its inference implementation. Heavy general-purpose ML runtimes are not
+  runtime dependencies.
 
-- Zig compiled to `wasm32-freestanding`.
-- WASM SIMD for CPU-side work.
-- WebGPU/WGSL for large tensor operations.
-- TypeScript for browser orchestration and the public SDK.
+Never describe a planned capability as implemented. Documentation, tests, examples, and release
+notes must distinguish **implemented**, **partial**, **experimental**, and **planned** behavior.
 
-The intended stack is deliberately small:
+## Priorities
 
-    TypeScript
-        |
-        +-- WebGPU -> WGSL
-        |
-        +-- WASM -> Zig -> WASM SIMD
+Resolve tradeoffs in this order:
 
-No server-side inference is required.
-
-Audio should not need to leave the user's machine.
-
----
-
-## Read This First
-
-Before modifying code, read:
-
-    docs/TIGER_STYLE.md
-
-TigerStyle is the coding and engineering style for this repository.
-
-Do not skim it.
-
-Its principles apply to Zig, TypeScript, WGSL, build tooling, tests, model
-conversion code, and architecture.
-
-Qwenscriber-specific constraints in this file supplement TigerStyle. If a
-project-specific requirement here conflicts directly with a generic rule in
-TigerStyle, follow this file, but preserve the intent of TigerStyle wherever
-possible.
-
-The priority order is:
-
-1. Safety.
-2. Performance.
+1. Safety and correctness.
+2. Predictable performance.
 3. Developer experience.
 
-Simplicity serves those goals; it does not override them.
-
----
-
-## Working Method
-
-Understand before abstracting.
-
-Measure before optimizing.
-
-Prefer a small experiment over architectural speculation.
-
-Work in vertical slices toward real transcription rather than accumulating
-framework code.
-
-The first meaningful milestone is:
-
-    real Qwen3-ASR audio
-        -> Qwenscriber preprocessing
-        -> Qwenscriber inference
-        -> decoded text
-
-using Qwen3-ASR 0.6B.
-
-After correctness, generalize and optimize toward 1.7B.
-
-Do not declare success because infrastructure exists.
-
----
-
-## Repository State
-
-Assume the repository may be under active development.
-
-Before changing anything:
-
-1. Run `git status`.
-2. Inspect the relevant files.
-3. Read nearby tests.
-4. Understand existing conventions.
-5. Preserve user changes.
-
-Do not overwrite, revert, or "clean up" unrelated work.
-
-Do not create commits unless explicitly asked.
-
-Run `git status` again before finishing.
-
----
-
-## Zig Version
-
-This project tracks current Zig master.
-
-Do not assume APIs from a historical stable Zig release.
-
-Before making build-system or standard-library assumptions, inspect:
-
-    zig version
-
-Prefer the compiler and documentation actually present in the development
-environment over stale examples from the internet.
-
-Run `zig fmt` on Zig sources.
-
----
-
-## Zig Runtime
-
-The browser core targets:
-
-    wasm32-freestanding
-
-It must not require:
-
-- WASI.
-- Emscripten.
-- libc.
-- Node.js.
-- A JS runtime embedded into the WASM module.
-
-Keep the WASM module genuinely freestanding.
-
-Use Zig-native facilities wherever practical.
-
-CPU hot paths should be designed so Zig can emit effective WASM SIMD.
-
-Prefer idiomatic Zig `@Vector` implementations before reaching for handwritten
-WASM intrinsics.
-
-Inspect generated code and benchmark before introducing lower-level machinery.
-
----
-
-## Runtime Responsibilities
-
-Keep ownership boundaries sharp.
-
-### TypeScript owns
-
-- Public SDK.
-- Browser feature detection.
-- Workers.
-- AudioWorklet integration.
-- Network fetching.
-- IndexedDB model caching.
-- WebGPU adapter/device acquisition.
-- GPU resource lifetime.
-- GPUBuffer creation.
-- Pipeline creation.
-- Bind groups.
-- Dispatch scheduling.
-- Model shard loading.
-- High-level inference orchestration.
-
-### Zig/WASM owns
-
-- Stable low-level ABI.
-- Audio sample conversion.
-- Resampling.
-- Log-mel preprocessing.
-- Normalization.
-- Tokenization and detokenization where appropriate.
-- Model metadata parsing.
-- Quantization metadata.
-- Decode state.
-- KV-cache bookkeeping.
-- Greedy/sampling decisions.
-- CPU reference kernels.
-- WASM SIMD fallback kernels.
-- Correctness/reference implementations for GPU work.
-
-### WGSL/WebGPU owns
-
-- Large matrix operations.
-- Fused dequantization + matmul.
-- Attention.
-- RMSNorm.
-- RoPE.
-- Activations.
-- Convolution required by the audio encoder.
-- Elementwise tensor operations.
-- Encoder execution.
-- Decoder tensor execution.
-
-Do not route every tensor operation through the WASM/JS boundary.
-
----
-
-## WebGPU
-
-WebGPU is the primary high-performance inference backend.
-
-Weights should generally flow:
-
-    network/cache
-        -> TypeScript
-        -> GPUBuffer
-        -> remain GPU-resident
-
-Avoid repeated CPU/GPU movement.
-
-Read back only compact results when practical.
-
-Do not assume support for a single giant model buffer.
-
-Inspect adapter/device limits, including:
-
-    maxBufferSize
-    maxStorageBufferBindingSize
-
-Design weight storage around sharding from the beginning.
-
-Prefer layer-oriented or otherwise naturally bounded GPU resources.
-
----
-
-## WASM Backend
-
-Support the conceptual backend choices:
-
-    auto
-    webgpu
-    wasm
-
-`auto` should select WebGPU when supported and suitable, otherwise use the WASM
-fallback.
-
-The WASM implementation serves three purposes:
-
-1. Portable fallback.
-2. Correctness reference.
-3. Test oracle for WebGPU kernels.
-
-Do not distort the WebGPU architecture merely to optimize 1.7B CPU inference.
-
-The 0.6B WASM path should still receive serious SIMD optimization where useful.
-
----
-
-## WASM ABI
-
-Keep the JS/WASM ABI:
-
-- Small.
-- Explicit.
-- Versioned.
-- Stable.
-- C-like.
-
-Never expose accidental Zig ABI details.
-
-Do not export:
-
-- Zig slices.
-- Zig error unions.
-- Zig optionals.
-- Layout-sensitive Zig structs.
-
-Prefer:
-
-- Fixed-width integers.
-- Integer handles.
-- Linear-memory offsets.
-- Explicit lengths.
-- Explicit enum values.
-- Documented byte layouts.
-- Machine-readable error codes.
-
-The ABI should have an explicit version from the beginning.
-
-Conceptually:
-
-    qw_version()
-
-    qw_init(...)
-    qw_deinit(...)
-
-    qw_alloc(...)
-    qw_free(...)
-
-    qw_audio_push(...)
-    qw_preprocess(...)
-
-    qw_model_parse(...)
-    qw_tensor_descriptor(...)
-
-    qw_decode_begin(...)
-    qw_decode_step(...)
-    qw_decode_end(...)
-
-The exact API may evolve. Keep it minimal.
-
-Routine invalid input must return a useful error rather than trap.
-
-A WASM trap should indicate a programmer error or violated invariant.
-
----
-
-## Memory
-
-Browser memory is a first-class design constraint.
-
-Avoid unnecessary copies.
-
-In particular, resist pipelines like:
-
-    network
-        -> JS copy
-        -> WASM copy
-        -> JS copy
-        -> GPU copy
-
-Prefer direct movement where browser APIs permit it.
-
-Separate:
-
-- Long-lived weights.
-- Persistent inference state.
-- KV cache.
-- Reusable activation buffers.
-- Short-lived scratch memory.
-
-Reuse fixed-capacity memory when practical.
-
-Follow TigerStyle's preference for bounded and initialization-time allocation in
-long-lived runtime paths.
-
-Know the maximum size of queues, buffers, loops, tensors, token sequences,
-audio windows, shards, and caches.
-
-Put a limit on everything.
-
----
-
-## Integer Types
-
-Use explicitly sized integer types for persisted formats, ABI structures,
-serialized metadata, tensor dimensions, indexes where bounds are known, and
-cross-language interfaces.
-
-Do not casually leak `usize` into persistent or external interfaces.
-
-Distinguish semantically between:
-
-- Index.
-- Count.
-- Byte size.
-- Element size.
-- Offset.
-
-Names should make units obvious.
-
-Examples:
-
-    tensor_count
-    tensor_index
-    shard_size_bytes
-    shard_offset_bytes
-    latency_ms_max
-
----
-
-## Assertions
-
-Assertions are expected.
-
-Assert:
-
-- Preconditions.
-- Postconditions.
-- Bounds.
-- Shape relationships.
-- Tensor sizes.
-- Alignment.
-- Quantization block invariants.
-- ABI invariants.
-- Compile-time constants.
-- State transitions.
-- Impossible enum values.
-- Relationships between serialized offsets and lengths.
-
-Prefer separate assertions:
-
-    assert(a);
-    assert(b);
-
-over:
-
-    assert(a and b);
-
-Test both valid and invalid spaces.
-
-Expected operational failures must be handled as errors, not assertions.
-
----
-
-## Control Flow
-
-Use explicit, bounded control flow.
-
-No recursion in runtime code.
-
-Avoid clever control flow.
-
-Loops must have understandable upper bounds.
-
-Keep branching centralized.
-
-Prefer:
-
-    push `if`s up
-    push `for`s down
-
-Parent functions should own control flow and state changes.
-
-Leaf helpers should preferably compute rather than mutate.
-
-Functions have a hard maximum of 70 lines.
-
-If a function grows beyond that, find the correct conceptual split rather than
-mechanically slicing it.
-
----
-
-## Naming
-
-Use TigerStyle naming.
-
-In particular:
-
-- `snake_case` for Zig functions, variables, and files.
-- Descriptive names over abbreviations.
-- Proper capitalization for acronyms.
-- Units and qualifiers at the end.
-- Nouns for concepts where practical.
-- Names that reveal ownership and lifetime.
-
-Avoid vague names such as:
-
-    data
-    thing
-    object
-    tmp
-    ctx
-
-unless the scope makes their meaning genuinely obvious.
-
-Choose terminology once and use it consistently across Zig, WGSL, TypeScript,
-the model format, tests, and documentation.
-
----
+Simplicity serves all three. It does not excuse an incomplete model, an accidental ABI, an
+unbounded resource path, or an unmeasured performance claim.
+
+## Ownership boundaries
+
+Keep each responsibility in its intended layer.
+
+| Layer | Owns |
+| --- | --- |
+| TypeScript | Public API, browser lifecycle, feature detection, downloads, caching, workers,
+  WebGPU objects, GPU buffers, pipeline creation, and orchestration |
+| Zig | Portable systems logic, audio preprocessing, tokenizer, metadata parsing, decode state,
+  CPU reference kernels, WASM SIMD kernels, allocation, and stable exported ABI |
+| WGSL | Large parallel tensor operations and fused GPU kernels |
+
+Do not build a large Zig-to-JavaScript binding layer for WebGPU objects. Do not route every tensor
+operation through WASM. Long-lived weights should be parsed, uploaded, and kept GPU-resident where
+possible.
+
+## Zig and build policy
+
+- Target the repository-pinned Zig master toolchain (`0.17.0-dev` lineage), not an older stable
+  release by habit.
+- Verify APIs against the installed compiler. Zig master moves; stale examples are not evidence.
+- The browser core targets `wasm32-freestanding`.
+- The WASM core must not require WASI, Emscripten, libc, Node, or an embedded JavaScript runtime.
+- The root `build.zig` is authoritative for Zig artifacts.
+- Keep the expected commands working as their steps land:
+  `zig build`, `zig build test`, `zig build wasm`, and `zig build test-wasm`.
+- Format and test after meaningful changes. Inspect compiler errors immediately rather than
+  accumulating speculative code.
 
 ## Dependencies
 
-Dependency austerity is a core design constraint.
-
-The browser runtime should preferably have zero production dependencies.
-
-Do not add:
-
-- ONNX Runtime.
-- TensorFlow.
-- PyTorch.
-- llama.cpp as a runtime dependency.
-- ggml as a runtime dependency.
-- Emscripten.
-- Large JavaScript ML frameworks.
-
-Native dependencies must be one of:
+Prefer dependencies in this order:
 
 1. Pure Zig.
-2. A Zig-native wrapper around C/C++.
-3. A C/C++ library consumed through Zig when justified.
-4. Our own narrow Zig wrapper around such a library.
-
-Before adding any dependency, explain why implementing the required subset
-ourselves is worse.
-
-Existing runtimes may be studied for:
-
-- Algorithms.
-- Tensor layouts.
-- Quantization.
-- Model semantics.
-- Correctness comparison.
-
-Do not turn them into hidden architectural dependencies.
-
----
-
-## Qwen3-ASR
-
-Implement the real Qwen3-ASR architecture.
-
-Do not treat it as merely a generic Qwen text model accepting arbitrary audio
-embeddings.
-
-Inspect official model configuration and source artifacts.
-
-The implementation must correctly account for:
-
-- Audio frontend.
-- Audio encoder.
-- Projection/adapter layers.
-- Decoder architecture.
-- Tokenization.
-- Generation semantics.
-- Special tokens.
-- Context handling.
-- Timestamp/alignment behavior when implemented.
-
-Bring up 0.6B first.
-
-Do not bake 0.6B-specific tensor dimensions throughout the runtime.
-
-1.7B compatibility is an architectural constraint from the beginning.
-
-Model-specific dimensions belong in validated configuration/metadata.
-
----
-
-## Model Format
-
-Qwenscriber may use its own browser-oriented model format.
-
-GGUF may be supported as an import/conversion source, but GGUF compatibility is
-not an architectural requirement.
-
-The distribution format should support:
-
-- Architecture/version metadata.
-- Model variant.
-- Tokenizer metadata.
-- Tensor names.
-- Tensor shapes.
-- Tensor data types.
-- Quantization format.
-- Quantization block size.
-- Shard identifier.
-- Byte offset.
-- Byte length.
-- Alignment.
-- Integrity checks where useful.
-
-Optimize for:
-
-- CDN delivery.
-- Range requests where useful.
-- IndexedDB caching.
-- Incremental loading.
-- GPU upload.
-- Browser memory pressure.
-
-Serialized formats must be versioned.
-
-Parsing must reject malformed or unsupported input cleanly.
-
----
-
-## Quantization
-
-Primary browser targets are expected to include Q4 and Q5-class formats.
-
-The desired data path is:
-
-    packed quantized weights
-        -> WGSL unpack/dequant
-        -> multiply
-        -> accumulation
-
-Avoid materializing complete FP16 copies of quantized weights merely to perform
-matmul.
-
-Quantization formats should be designed around measured WebGPU behavior.
-
-Do not choose block sizes or layouts because they look elegant.
-
-Benchmark them.
-
-Conversion and runtime definitions must share format/layout definitions where
-possible to prevent drift.
-
----
-
-## TypeScript
-
-Keep the public SDK small and unsurprising.
-
-Target an API roughly like:
-
-    import { Qwenscriber } from "@qwenscriber/qwenscriber";
-
-    const asr = await Qwenscriber.create({
-        model: "qwen3-asr-1.7b",
-        quantization: "q4",
-        backend: "auto",
-    });
-
-    const result = await asr.transcribe(audio);
-
-    asr.dispose();
-
-Eventually:
-
-    for await (const segment of asr.stream(microphone)) {
-        console.log(segment.text);
-    }
-
-Provide capability inspection for things such as:
-
-- WebGPU.
-- WASM SIMD.
-- Worker support.
-- SharedArrayBuffer.
-- Adapter limits.
-- Selected backend.
-
-Do not expose internal GPU machinery through the normal SDK unless it is
-required for an advanced low-level API.
-
-Avoid production npm dependencies unless clearly justified.
-
----
-
-## Browser Execution
-
-Inference must not block the UI thread.
-
-Prefer:
-
-    main thread
-        -> Worker
-            -> WASM
-            -> WebGPU
-
-Use AudioWorklet for realtime capture when appropriate.
-
-Do not require SharedArrayBuffer for basic offline transcription unless there is
-a compelling technical reason.
-
-Streaming may use SharedArrayBuffer when it materially improves the design.
-
-Always provide explicit bounds on streaming queues and buffered audio.
-
----
-
-## WGSL
-
-Treat shaders as production source code.
-
-Keep kernels:
-
-- Small.
-- Focused.
-- Explicit.
-- Testable independently.
-
-Avoid shader metaprogramming complexity unless measurement justifies it.
-
-Document memory layouts shared between Zig, TypeScript, and WGSL.
-
-Changes to a shared layout must include corresponding tests.
-
-GPU kernels must be checked against deterministic CPU reference implementations
-before being trusted as part of full-model inference.
-
----
-
-## Correctness Strategy
-
-Do not debug the entire model as one black box.
-
-Build upward.
-
-For each important kernel:
-
-1. Generate a small deterministic input.
-2. Compute expected output using straightforward Zig reference code.
-3. Execute the WGSL implementation.
-4. Read the result back.
-5. Compare using justified tolerances.
-
-Apply this to at least:
-
-- Matmul.
-- Quantized matmul.
-- Dequantization.
-- RMSNorm.
-- RoPE.
-- Attention.
-- Activations.
-- Convolution.
-- Encoder blocks.
-- Decoder blocks.
-
-Then compare progressively larger model fragments against a trusted reference.
-
----
-
-## Tests
-
-Tests are part of implementation, not cleanup.
-
-Maintain tests for:
-
-- ABI version/layout.
-- Manifest parsing.
-- Invalid manifests.
-- Audio conversion.
-- Resampling.
-- Log-mel preprocessing.
-- Quantization.
-- Dequantization.
-- Tokenization.
-- Shape validation.
-- Tensor indexing.
-- Reference math.
-- State transitions.
-- Bounds.
-- Error paths.
-
-Browser/WebGPU tests should use small deterministic fixtures.
-
-Do not commit full model checkpoints to the repository.
-
-Test negative space, not just happy paths.
-
----
-
-## Performance
-
-Performance starts at design time.
-
-Before implementing large subsystems, sketch expected costs in terms of:
-
-- Network bandwidth/latency.
-- Storage bandwidth/latency.
-- Memory bandwidth/capacity.
-- CPU.
-- GPU.
-- CPU/GPU synchronization.
-
-Pay particular attention to model download size and memory bandwidth.
-
-Batch work where possible.
-
-Avoid repeated small GPU submissions when larger predictable batches are
-possible.
-
-Avoid unnecessary synchronization and readback.
-
-Hot Zig loops should be isolated into simple functions with primitive arguments
-when doing so improves optimization and inspectability.
-
-Do not claim performance improvements without measurement.
-
----
-
-## Benchmarks
-
-Maintain hooks to measure:
-
-- Model download/load time.
-- Cached load time.
-- Model size.
-- GPU upload time.
-- Audio preprocessing throughput.
-- First-token latency.
-- Decode tokens/second.
-- Real-time factor.
-- Individual GPU kernel timings.
-- WASM memory usage.
-- Approximate GPU memory usage.
-
-Record enough environment information for numbers to mean something.
-
-Performance regressions should be explainable.
-
----
-
-## Tooling
-
-Prefer Zig for repository tooling where practical.
-
-A Zig tool is generally preferable to another shell/Python dependency for
-permanent project infrastructure.
-
-Temporary scripts used for reference validation are acceptable when they
-materially accelerate bring-up.
-
-Do not make Python a production runtime requirement.
-
-Model conversion should trend toward a Zig executable, conceptually:
-
-    qwenscriber-convert \
-        --input <checkpoint> \
-        --output <model> \
-        --quant q4
-
-The converter should eventually:
-
-- Read official metadata.
-- Validate architecture.
-- Map tensor names.
-- Transpose/repack tensors.
-- Quantize.
-- Shard.
-- Generate manifests.
-- Generate integrity metadata.
-- Validate emitted tensors.
-
----
-
-## Build
-
-The Zig build is authoritative for Zig artifacts.
-
-Expected commands should remain simple, ideally converging on:
-
-    zig build
-    zig build test
-    zig build wasm
-    zig build test-wasm
-
-TypeScript/browser tooling may have its own commands where necessary.
-
-Keep the toolchain small.
-
-The WASM output must be deterministic enough to package reliably.
-
-Explicitly configure the intended WASM feature set rather than depending on
-accidental compiler defaults.
-
----
-
-## Formatting
-
-For Zig:
-
-    zig fmt
-
-Hard limit source lines to 100 columns.
-
-Use 4 spaces where formatting is not automatically controlled.
-
-Follow equivalent discipline in TypeScript and WGSL.
-
-Do not disable formatting rules simply to accommodate awkward code. Improve the
-code shape.
-
----
-
-## Comments
-
-Comments explain why and how.
-
-Do not write comments that merely translate the next line into English.
-
-Write full sentences.
-
-Explain:
-
-- Non-obvious invariants.
-- Architectural constraints.
-- Numeric constants.
-- Memory layouts.
-- Browser quirks.
-- Quantization choices.
-- Performance tradeoffs.
-- Workarounds.
-
-A surprising assertion can sometimes document an invariant better than a
-comment.
-
----
+2. A Zig-native wrapper over a C or C++ library.
+3. A C or C++ library consumed through `@cImport`/translate-c where practical.
+4. A thin wrapper we own that exposes Zig-native idioms internally.
+5. An external build mechanism only when the previous options are genuinely inadequate.
+
+Prefer implementing small, bounded functionality over importing a large general-purpose package.
+The browser runtime should have zero production dependencies unless a dependency clears a high
+bar. Do not introduce ONNX Runtime, TensorFlow, PyTorch, llama.cpp, ggml, Emscripten, or a giant
+JavaScript ML framework as a runtime dependency.
+
+Record each new dependency's purpose, license, update mechanism, and why a smaller option was not
+sufficient.
+
+## Control flow and bounds
+
+- Use explicit, simple control flow. Avoid recursion in runtime code.
+- Put an explicit upper bound on loops, queues, buffers, shards, tensor ranks, audio duration, and
+  decode work. Assert a deliberate infinite event loop where one is truly intended.
+- Use explicitly sized integer types at serialized and ABI boundaries. Avoid accidental
+  architecture-sized layouts.
+- Keep variables in the smallest useful scope.
+- Keep functions at or below 70 lines. Centralize branching; push leaf computation into focused
+  helpers.
+- Keep lines at or below 100 columns unless a machine-generated format makes that unreasonable.
+- Split compound assertions and complicated conditions so the valid and invalid spaces are clear.
+- Handle all expected errors. Traps and panics are for violated invariants, not malformed input or
+  unsupported models.
+
+## Assertions and invariants
+
+Assertions document and enforce programmer assumptions.
+
+- Assert inputs, outputs, preconditions, postconditions, and internal relationships.
+- Pair important assertions across different paths, such as before serialization and after parse.
+- Assert compile-time layout, size, alignment, and constant relationships.
+- Test the positive space and the negative space.
+- Never use assertions as a replacement for understanding the model topology or buffer lifetime.
+
+## Memory discipline
+
+- Make ownership and lifetime explicit.
+- Separate long-lived weights from ephemeral activations.
+- Prefer bounded arenas and reuse for hot paths.
+- Avoid invisible copies across network buffers, JavaScript, WASM memory, and GPU buffers.
+- Treat browser memory and WebGPU binding limits as architectural constraints.
+- Inspect `maxBufferSize` and `maxStorageBufferBindingSize`; never assume one enormous GPU buffer.
+- Do not dynamically allocate in steady-state hot loops unless the design explicitly justifies it
+  and measurements support it.
+
+## ABI policy
+
+The exported ABI is a product surface, not a compiler accident.
+
+- Use C semantics: fixed-width integers, explicit byte buffers, integer or opaque handles, and
+  documented ownership.
+- Version the ABI from the beginning.
+- Do not export Zig slices, error unions, optionals, or structs with accidental layout.
+- Return machine-readable error codes and expose contextual error information deliberately.
+- Validate every pointer, length, alignment, handle, enum value, and state transition.
+- Add layout and compatibility tests before changing the ABI.
+- The CLI and language bindings depend on the core SDK; the core SDK never depends on them.
+
+## Model and tensor policy
+
+- Implement the actual Qwen3-ASR audio encoder, projection, and decoder topology. Do not assume it
+  is a generic text model with an audio tensor attached.
+- Do not hard-code 0.6B dimensions in ways that block 1.7B.
+- Keep tensor names, shapes, layouts, and conversions validated at every boundary.
+- The distribution format is Qwenscriber-owned and optimized for streaming, caching, sharding,
+  and direct WebGPU use. GGUF may be an import source, not the architecture.
+- Prefer fused unpack/dequantize/multiply kernels over materializing full floating-point weights.
+- Share format and tensor definitions between converter and runtime wherever feasible.
+- Never commit downloaded checkpoints or generated weight shards.
+
+## WebGPU and WGSL
+
+- Establish correctness against deterministic Zig CPU references before optimizing a kernel.
+- Test small tensors, edge shapes, invalid metadata, and numerical tolerances.
+- Minimize CPU/GPU synchronization and read back only compact results when possible.
+- Measure adapter limits and design for multiple layer- or shard-oriented buffers.
+- Keep shader interfaces explicit and validate bindings, offsets, alignment, and dispatch bounds.
+- Do not claim speedups without benchmark data and a reproducible baseline.
+
+## Testing expectations
+
+Changes should add or update the smallest test that proves the behavior.
+
+Minimum test layers include:
+
+- Zig unit and deterministic math tests.
+- ABI version, size, layout, and invalid-input tests.
+- Manifest and tensor-shape validation tests.
+- Audio preprocessing, tokenizer, quantization, and dequantization tests.
+- CPU-versus-WGSL conformance tests.
+- Browser integration tests for WebGPU and WASM SIMD.
+- Small end-to-end fixtures that are legal and practical to keep in git.
+
+The first meaningful milestone is a correct real transcript through our preprocessing, runtime,
+backend, and decoder—not a large abstraction graph.
+
+## Performance work
+
+- Sketch network, disk, memory, and CPU costs before implementation.
+- Record model load, cache-hit load, first-token latency, real-time factor, preprocessing
+  throughput, GPU upload and kernel time, peak WASM/GPU memory, model size, and decoder tokens/sec.
+- Benchmark release builds on identified hardware and browser versions.
+- Keep correctness baselines when adding fast paths.
+- Optimize measured bottlenecks without erasing clear ownership or bounded behavior.
 
 ## Documentation
 
-Keep documentation truthful.
+- Keep `README.md` short and honest; detailed material belongs in the mdBook under `docs/`.
+- Update documentation in the same change as a public API, ABI, command, configuration, format, or
+  support-status change.
+- Mark illustrative interfaces as provisional.
+- Explain why a design exists, not only what it does.
+- Add or update an ADR when a change alters a durable cross-layer decision.
+- The published site is `https://mattneel.github.io/qwenscriber` and is built from `docs/` by CI.
 
-Clearly distinguish:
+## Git and generated files
 
-- Implemented.
-- Experimental.
-- Partial.
-- Planned.
+Check repository status before and after work. Do not add Zig caches, `node_modules`, browser
+caches, model checkpoints, generated shards, large benchmark output, or temporary fixtures.
 
-Do not advertise planned functionality as working.
+Do not modify generated artifacts by hand. Change their source or generator and reproduce them.
+Do not commit or publish unless explicitly asked.
 
-Update documentation when changing:
+## Licensing and provenance
 
-- Public API.
-- Model format.
-- ABI.
-- Browser requirements.
-- Build steps.
-- Supported models.
-- Supported quantization.
-- Backend behavior.
+Prefer official model files/specifications, Zig sources/docs, WebGPU/WGSL specifications, and
+browser vendor documentation. Track the license and provenance of adapted code, algorithms,
+fixtures, tokenizer data, and model artifacts. Study compatible implementations, but independently
+implement where licensing or architecture requires it.
 
----
+## Definition of done
 
-## Generated and Large Files
+A change is done when:
 
-Do not commit:
+- the implementation is bounded and its ownership is clear;
+- expected errors are handled and invariants are asserted;
+- relevant unit, conformance, and integration tests pass;
+- formatting and repository checks pass;
+- performance claims have measurements;
+- public behavior and status documentation are current; and
+- no generated junk or model weights have entered the repository.
 
-- Downloaded checkpoints.
-- Converted full model weights.
-- Browser caches.
-- `node_modules`.
-- Zig cache artifacts.
-- Large benchmark outputs.
-- Temporary tensor dumps.
-- Generated scratch data.
-
-Maintain `.gitignore` accordingly.
-
-Small deterministic fixtures needed for testing are acceptable.
-
----
-
-## External Research
-
-Prefer primary sources:
-
-- Official Qwen/Qwen3-ASR repositories and model files.
-- Zig documentation and source.
-- WebGPU specification.
-- WGSL specification.
-- Browser vendor documentation.
-
-When uncertain about the model architecture or an API, research it.
-
-Do not invent details.
-
-When two sources disagree, identify the disagreement and verify empirically
-where practical.
-
----
-
-## Finishing a Change
-
-Before considering work complete:
-
-1. Run formatting.
-2. Run relevant unit tests.
-3. Run the broader test suite when practical.
-4. Build affected targets.
-5. Check generated artifacts where relevant.
-6. Check `git diff`.
-7. Check `git status`.
-8. Confirm no unrelated user changes were modified.
-9. Confirm documentation still describes reality.
-
-For performance-sensitive changes, run the relevant benchmark.
-
-For GPU changes, compare against the CPU reference implementation.
-
-For model-format or ABI changes, verify backward/version handling explicitly.
-
----
-
-## Standard
-
-Do the hard thinking early.
-
-Prefer deleting an abstraction to explaining why it is necessary.
-
-Prefer bounded data structures to open-ended ones.
-
-Prefer an explicit state machine to implicit state.
-
-Prefer known memory use to convenient allocation.
-
-Prefer a boring ABI to a clever binding layer.
-
-Prefer one well-understood kernel to three generic frameworks.
-
-Prefer measured performance to assumed performance.
-
-Prefer working end-to-end transcription to architectural pageantry.
-
-Keep it small.
-Keep it fast.
-Keep it correct.
