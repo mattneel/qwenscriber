@@ -426,14 +426,31 @@ pub const Model = struct {
     /// audio tower's output on its own and compare it against the reference
     /// implementation stage by stage.
     pub fn encodeAudio(self: *Model, log_mel: []const f32, frames: u32) Error!u32 {
+        const steps = try self.encodeConvStage(log_mel, frames);
+        try self.runAudioTower(steps);
+        return steps;
+    }
+
+    /// The convolution stack and its projection, packed, without the tower's
+    /// blocks. Returns the step count.
+    ///
+    /// Split from `encodeAudio` because the reference implementation dumps this
+    /// stage on its own (`audio_conv_out`), and comparing it is what separates a
+    /// convolution defect from a block defect. Nothing else calls it.
+    pub fn encodeConvStage(self: *Model, log_mel: []const f32, frames: u32) Error!u32 {
         const config = &self.config;
         const steps = config.packedStepCount(frames);
         if (steps > self.maxSteps()) return Error.AudioTooLong;
         if (log_mel.len != @as(usize, config.mel_bins) * frames) return Error.UnexpectedShape;
-
         try self.convolveAndPack(log_mel, frames, steps);
-        try self.runAudioTower(steps);
         return steps;
+    }
+
+    /// The tower's blocks, over a packed sequence produced by `encodeConvStage`.
+    /// Split for the same reason: the two stages are dumped and compared
+    /// separately against the reference.
+    pub fn encodeTowerStage(self: *Model, steps: u32) Error!void {
+        return self.runAudioTower(steps);
     }
 
     /// The packed audio tower output for the most recent `encodeAudio`.
@@ -680,10 +697,18 @@ pub const Model = struct {
 
 const assert = std.debug.assert;
 
-/// Sinusoidal position embedding used by the audio tower.
+/// Adds the sinusoidal position embedding for `step` onto `row`, in place.
 ///
 /// `log_timescale_increment = ln(10000) / (channels / 2 - 1)`, and the row is
 /// `concat(sin(scaled), cos(scaled))`, exactly as the reference builds it.
+///
+/// The addition is the whole content of this function: the reference does
+/// `conv_out += positional_embedding[:time_steps]`, so the embedding is a term
+/// *added* to the projected convolution output. It wrote the embedding over the
+/// row instead, and because it covers every index of the row, that discarded the
+/// projected convolution output completely — the tower saw a pure position
+/// signal with no audio in it, which is why a 1-second tone and a speech clip
+/// decoded the same tokens.
 fn addSinusoidalPosition(row: []f32, step: u32, channels: u32) void {
     const half = channels / 2;
     const log_timescale_increment = @log(10000.0) /
@@ -693,8 +718,8 @@ fn addSinusoidalPosition(row: []f32, step: u32, channels: u32) void {
     while (index < half) : (index += 1) {
         const inverse_timescale = @exp(-log_timescale_increment * @as(f64, @floatFromInt(index)));
         const angle = position * inverse_timescale;
-        row[index] = @floatCast(@sin(angle));
-        row[half + index] = @floatCast(@cos(angle));
+        row[index] += @floatCast(@sin(angle));
+        row[half + index] += @floatCast(@cos(angle));
     }
 }
 
@@ -1060,7 +1085,9 @@ test "sinusoidal positions match the reference construction" {
     for (row[32..]) |value| try std.testing.expectApproxEqAbs(@as(f32, 1.0), value, 1e-6);
 
     // At position one the first pair rotates by exactly one radian, because
-    // its inverse timescale is exp(0) = 1.
+    // its inverse timescale is exp(0) = 1. The row is cleared first so these
+    // checks read position one's embedding alone.
+    @memset(&row, 0.0);
     addSinusoidalPosition(&row, 1, 64);
     for (row) |value| {
         try std.testing.expect(@abs(value) <= 1.0);
@@ -1073,6 +1100,16 @@ test "sinusoidal positions match the reference construction" {
     try std.testing.expect(@abs(row[1]) > @abs(row[30]));
     try std.testing.expect(@abs(row[62]) > @abs(row[32]));
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), row[62], 1e-4);
+
+    // The embedding is a term *added* to the projected convolution output, the
+    // reference's `conv_out += positional[...]`, not a value written over it.
+    // Both rows above start at zero, so an implementation that assigned would
+    // pass every check in them while discarding the audio entirely.
+    var seeded: [64]f32 = undefined;
+    @memset(&seeded, 0.25);
+    addSinusoidalPosition(&seeded, 0, 64);
+    for (seeded[0..32]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-6);
+    for (seeded[32..]) |value| try std.testing.expectApproxEqAbs(@as(f32, 1.25), value, 1e-6);
 }
 
 test "binding accessors interpret the two planes correctly" {

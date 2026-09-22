@@ -38,6 +38,16 @@ STAGES = [
         "order and from computing re^2+im^2 instead of abs()**2",
     ),
     (
+        "audio_conv_out",
+        "audio_conv_out.f32",
+        ("abs", 1e-3),
+        "convolution stack, its projection, and the sinusoidal position "
+        "embedding for the first chunk: measured 8.7e-6 worst case on the f16 "
+        "conversion. An assignment instead of an addition in that embedding "
+        "measures 4.4 here, so a tolerance three orders of magnitude below the "
+        "signal still catches the defect this stage exists for",
+    ),
+    (
         "audio_encoded",
         "audio_encoded.f32",
         ("rel", 2e-2),
@@ -116,10 +126,18 @@ def main() -> int:
             continue
 
         difference = np.abs(ours - reference)
-        scale = np.maximum(np.abs(reference), 1e-6)
-        relative = float(np.max(difference / scale))
+        # `rel` is the worst absolute difference as a fraction of the reference
+        # tensor's largest magnitude, *not* the worst per-element ratio. A
+        # per-element ratio divides by whatever a single element happens to be,
+        # and an element that sits near zero turns a bit-exact-in-scale match
+        # into a huge one: the f16 conversion agrees with the reference to
+        # max|d| 9.1e-6 on `audio_encoded` and still read 9.1e-2 that way,
+        # because one element of the reference is ~1e-4. Comparing against the
+        # tensor's scale is what the justifications below describe.
+        scale = float(np.max(np.abs(reference))) if reference.size else 0.0
         worst = float(np.max(difference)) if difference.size else 0.0
         mean = float(np.mean(difference)) if difference.size else 0.0
+        relative = worst / max(scale, 1e-9)
 
         if kind == "exact":
             ok = bool(np.array_equal(ours, reference))

@@ -584,8 +584,12 @@ pub fn decodeAttentionStep(
     const key_value_width = key_value_heads * head_dim;
     if (query.len != query_width) return Error.ShapeMismatch;
     if (out.len != query_width) return Error.ShapeMismatch;
-    if (cache_keys.len != @as(usize, cached) * key_value_width) return Error.ShapeMismatch;
-    if (cache_values.len != cache_keys.len) return Error.ShapeMismatch;
+    // A view into a layer's cache is normally a whole `max_positions` wide, and
+    // only the first `cached` positions are read, so the contract is "at least"
+    // here exactly as it is for `scores` below. Requiring an exact length made
+    // every caller reproduce the slicing arithmetic the kernel already does.
+    if (cache_keys.len < @as(usize, cached) * key_value_width) return Error.ShapeMismatch;
+    if (cache_values.len < @as(usize, cached) * key_value_width) return Error.ShapeMismatch;
     if (scores.len < cached) return Error.ShapeMismatch;
     if (heads % key_value_heads != 0) return Error.ShapeMismatch;
 

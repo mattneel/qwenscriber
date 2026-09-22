@@ -154,11 +154,19 @@ pub const Decoder = struct {
                 value[0..key_value_width],
             );
 
+            // Exactly the positions this layer has cached: the cache is
+            // layer-major, and the kernel checks the slice length against the
+            // number of positions it is told about, so handing it the layer's
+            // whole stride fails for every position but the last.
+            const cached_width = @as(usize, self.position + 1) * key_value_width;
+            const layer_offset = @as(usize, layer_index) * cache_layer_stride;
+            const layer_cache = model.scratch.cache_keys[layer_offset..][0..cached_width];
+            const layer_values = model.scratch.cache_values[layer_offset..][0..cached_width];
             try kernels.decodeAttentionStep(
                 attention_out,
                 query,
-                model.scratch.cache_keys[@as(usize, layer_index) * cache_layer_stride ..],
-                model.scratch.cache_values[@as(usize, layer_index) * cache_layer_stride ..],
+                layer_cache,
+                layer_values,
                 self.position + 1,
                 config.text_attention_heads,
                 config.text_key_value_heads,

@@ -107,7 +107,17 @@ def main() -> int:
     captured: dict[str, torch.Tensor] = {}
 
     def capture_conv_out(module, module_inputs, module_outputs):
-        captured["conv_out"] = module_outputs.detach().clone()
+        # The hook fires inside the tower's forward, *before*
+        # `conv_out += positional_embedding[:time_steps]` runs, so the sinusoidal
+        # embedding is added here too. The stage this fixture names — see the
+        # module docstring — is the tensor the tower's blocks receive, which is
+        # what the runtime's `audio_conv_out` dump holds. A fixture captured
+        # without it is a different tensor, and the two differ by the whole
+        # embedding (max|d| ~4.4, i.e. the sinusoid's own range) wherever a
+        # comparison pairs them.
+        hidden = module_outputs.detach().clone()
+        table = audio_tower.positional_embedding.positional_embedding
+        captured["conv_out"] = hidden + table[: hidden.shape[1]].to(hidden.dtype)
 
     handle = audio_tower.register_forward_hook(
         lambda module, module_inputs, module_outputs: captured.__setitem__(
@@ -135,7 +145,12 @@ def main() -> int:
     generated = None
 
     def capture_step(step: int, logits: torch.Tensor) -> None:
-        row = logits[0].float()
+        # The last position's row, so the top-k is the distribution the next
+        # token comes from: the head may be handed the whole prompt or only its
+        # last position, and `[0, -1]` is the same row either way. It is also the
+        # rank the runtime writes (`logits_step0.f32` is one row of 151936, not a
+        # `(1, 151936)` batch), so the two files compare directly.
+        row = logits[0, -1].float()
         top = torch.topk(row, args.top_k)
         step_records.append((int(row.argmax()), top.indices.numpy(), top.values.numpy()))
 
@@ -143,8 +158,12 @@ def main() -> int:
         def hook(module, module_inputs, module_outputs):
             nonlocal first_step_logits
             logits = module_outputs if torch.is_tensor(module_outputs) else module_outputs[0]
-            if step == 0:
-                first_step_logits = logits[0].detach().clone()
+            # `step`'s hook fires on *every* head call, not only the first, so
+            # without the `is None` guard `first_step_logits` ends up holding the
+            # last call's row — the distribution after generation finished — and
+            # the fixture would not be the stage it is named for.
+            if step == 0 and first_step_logits is None:
+                first_step_logits = logits[0, -1].detach().clone()
             capture_step(step, logits.detach())
         return hook
 
