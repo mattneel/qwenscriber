@@ -43,69 +43,69 @@ pub const Decoder = struct {
     }
 
     /// Where one layer's quantized cache lives, in bytes.
-///
-/// Both formats are written by `appendCacheRow` and read by the attention kernels, so the offsets are
-/// computed here once: a second copy of this arithmetic is how a layout and its readers drift apart.
-const CachePlane = struct {
-    /// Bytes of scale plane per layer, which precede the codes.
-    scales: usize,
-    /// Bytes of code plane per layer.
-    codes: usize,
-    /// Bytes from one layer's planes to the next.
-    stride: usize,
-};
+    ///
+    /// Both formats are written by `appendCacheRow` and read by the attention kernels, so the offsets are
+    /// computed here once: a second copy of this arithmetic is how a layout and its readers drift apart.
+    const CachePlane = struct {
+        /// Bytes of scale plane per layer, which precede the codes.
+        scales: usize,
+        /// Bytes of code plane per layer.
+        codes: usize,
+        /// Bytes from one layer's planes to the next.
+        stride: usize,
+    };
 
-fn cachePlane(model: *const Model) CachePlane {
-    const config = model.config;
-    const groups_per_row = model.kvWidth() / quant.group_size;
-    const scales = @as(usize, config.max_positions) * groups_per_row *
-        quant.q4_scale_bytes_per_group;
-    const codes = @as(usize, config.max_positions) * model.kvWidth();
-    return .{ .scales = scales, .codes = codes, .stride = scales + codes };
-}
-
-/// Appends one key and value row to their layer's cache, quantizing when the cache holds codes.
-fn appendCacheRow(
-    model: *Model,
-    layer_index: u32,
-    position: u32,
-    key: []const f32,
-    value: []const f32,
-) void {
-    const row_width = model.kvWidth();
-    assert(key.len == row_width);
-    assert(value.len == row_width);
-    assert(position < model.config.max_positions);
-
-    if (model.cache_format == .f32) {
-        const stride = @as(usize, model.config.max_positions) * row_width;
-        const offset = @as(usize, layer_index) * stride + @as(usize, position) * row_width;
-        @memcpy(model.scratch.cache_keys[offset..][0..row_width], key);
-        @memcpy(model.scratch.cache_values[offset..][0..row_width], value);
-        return;
+    fn cachePlane(model: *const Model) CachePlane {
+        const config = model.config;
+        const groups_per_row = model.kvWidth() / quant.group_size;
+        const scales = @as(usize, config.max_positions) * groups_per_row *
+            quant.q4_scale_bytes_per_group;
+        const codes = @as(usize, config.max_positions) * model.kvWidth();
+        return .{ .scales = scales, .codes = codes, .stride = scales + codes };
     }
 
-    const plane = cachePlane(model);
-    const layer_offset = @as(usize, layer_index) * plane.stride;
-    const groups_per_row = row_width / quant.group_size;
-    const scale_bytes = groups_per_row * quant.q4_scale_bytes_per_group;
-    const scale_offset = layer_offset + @as(usize, position) * scale_bytes;
-    const code_offset = layer_offset + plane.scales + @as(usize, position) * row_width;
-    quant.quantizeRow(
-        .q8,
-        key,
-        model.scratch.cache_keys_q8[scale_offset..][0..scale_bytes],
-        model.scratch.cache_keys_q8[code_offset..][0..row_width],
-    );
-    quant.quantizeRow(
-        .q8,
-        value,
-        model.scratch.cache_values_q8[scale_offset..][0..scale_bytes],
-        model.scratch.cache_values_q8[code_offset..][0..row_width],
-    );
-}
+    /// Appends one key and value row to their layer's cache, quantizing when the cache holds codes.
+    fn appendCacheRow(
+        model: *Model,
+        layer_index: u32,
+        position: u32,
+        key: []const f32,
+        value: []const f32,
+    ) void {
+        const row_width = model.kvWidth();
+        assert(key.len == row_width);
+        assert(value.len == row_width);
+        assert(position < model.config.max_positions);
 
-/// Drops the key/value cache and returns to an empty context.
+        if (model.cache_format == .f32) {
+            const stride = @as(usize, model.config.max_positions) * row_width;
+            const offset = @as(usize, layer_index) * stride + @as(usize, position) * row_width;
+            @memcpy(model.scratch.cache_keys[offset..][0..row_width], key);
+            @memcpy(model.scratch.cache_values[offset..][0..row_width], value);
+            return;
+        }
+
+        const plane = cachePlane(model);
+        const layer_offset = @as(usize, layer_index) * plane.stride;
+        const groups_per_row = row_width / quant.group_size;
+        const scale_bytes = groups_per_row * quant.q4_scale_bytes_per_group;
+        const scale_offset = layer_offset + @as(usize, position) * scale_bytes;
+        const code_offset = layer_offset + plane.scales + @as(usize, position) * row_width;
+        quant.quantizeRow(
+            .q8,
+            key,
+            model.scratch.cache_keys_q8[scale_offset..][0..scale_bytes],
+            model.scratch.cache_keys_q8[code_offset..][0..row_width],
+        );
+        quant.quantizeRow(
+            .q8,
+            value,
+            model.scratch.cache_values_q8[scale_offset..][0..scale_bytes],
+            model.scratch.cache_values_q8[code_offset..][0..row_width],
+        );
+    }
+
+    /// Drops the key/value cache and returns to an empty context.
     pub fn reset(self: *Decoder) void {
         self.position = 0;
         // Whichever pair the model was loaded for, and only that one: the other is empty.

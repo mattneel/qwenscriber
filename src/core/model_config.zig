@@ -257,7 +257,6 @@ pub const Config = extern struct {
         return self.text_key_value_heads * self.text_head_dim;
     }
 
-
     pub fn validate(self: *const Config) Error!void {
         if (!std.mem.eql(u8, &self.magic, &magic_bytes)) return Error.BadMagic;
         if (self.format_version != format_version) return Error.BadVersion;

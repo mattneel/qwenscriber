@@ -41,7 +41,7 @@ pub const CacheFormat = enum(u32) {
     _,
 
     pub fn code(self: CacheFormat) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
