@@ -87,6 +87,9 @@ export const TOLERANCES = {
     // The accumulation order matches the reference tap for tap and the f16 decode is exact, so the
     // bound is GELU's `exp` plus the adapter's arithmetic.
     conv3x3: { atol: 1e-4, rtol: 1e-4 },
+    // Both sides multiply f16 weights that decode exactly to the same f32 values, in the same
+    // accumulation order, so the difference is the adapter's arithmetic alone.
+    matmul_f16: { atol: 1e-3, rtol: 1e-4 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -197,6 +200,30 @@ function build_matmul_cases() {
             expected: expected_f32,
             tolerance: TOLERANCES.matmul,
             detail: `tokens ${tokens}, rows ${rows}, cols ${cols}`,
+        },
+        {
+            // The same weights, rounded to f16 and read back, which is what the kernel decodes:
+            // the reference then sees exactly the values the shader does.
+            name: "matmul_f16",
+            shader: "matmul_f16.wgsl",
+            entry_point: "matmul_f16_main",
+            workgroup: [16, 16, 1],
+            bindings: [
+                { uniform: pack_uniform([tokens, rows, cols, 0]) },
+                { input: activations },
+                { input: ref.pack_f16_pairs(weights) },
+                { output: tokens * rows },
+            ],
+            dispatch: [ceil_div(rows, 16), ceil_div(tokens, 16), 1],
+            expected: ref.matmul_f32_reference(
+                activations,
+                Float32Array.from(weights, (value) => ref.from_f16_bits(ref.to_f16_bits(value))),
+                tokens,
+                rows,
+                cols,
+            ),
+            tolerance: TOLERANCES.matmul_f16,
+            detail: `tokens ${tokens}, rows ${rows}, cols ${cols}, f16 weights`,
         },
     ];
 

@@ -19,6 +19,7 @@ export type WebGpuKernelName =
   | "matmul_f32"
   | "matmul_q4"
   | "matmul_q5"
+  | "matmul_f16"
   | "rmsnorm"
   | "rope"
   | "attention"
@@ -94,6 +95,19 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
     entryPoint: "matmul_q5_main",
     workgroupSize: MATMUL_TILE_WORKGROUP,
     workgroupStorageBytes: MATMUL_TILE_STORAGE_BYTES,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 3, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  matmul_f16: {
+    name: "matmul_f16",
+    file: "matmul_f16.wgsl",
+    entryPoint: "matmul_f16_main",
+    workgroupSize: [16, 16, 1],
+    workgroupStorageBytes: 2 * 16 * 16 * 4,
     bindings: [
       { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
