@@ -31,7 +31,10 @@ import {
   writeTokenizerDescriptor,
   type Alignment,
   type ModelRequirements,
+  type TensorDescriptor,
   type TokenizerDescriptor,
+  TENSOR_DESCRIPTOR_BYTES,
+  readTensorDescriptor,
 } from "./abi.ts";
 import { AbiMismatchError, NotImplementedError, QwenscriberError, SDK_STATUS, throwForStatus } from "../errors.ts";
 
@@ -98,6 +101,12 @@ interface ModelExports {
   qw_model_begin(handle: number): number;
   qw_model_add_shard(handle: number, shard_ptr: number, shard_len: number): number;
   qw_model_finish(handle: number, config_ptr: number, config_len: number): number;
+  // Optional: a module built before tensor enumeration answers neither, and a caller that never
+  // enumerates tensors is unaffected -- which is the model family's rule for growing in place.
+  qw_model_tensor_count?: ((handle: number, out_ptr: number) => number) | undefined;
+  qw_model_tensor_descriptor?:
+    | ((handle: number, index: number, out_ptr: number) => number)
+    | undefined;
   qw_model_requirements(handle: number, out_ptr: number): number;
   qw_decode_begin(
     handle: number,
@@ -206,6 +215,15 @@ function requireVoidExport(raw: WebAssembly.Exports, name: string): (...args: nu
  * in the same step. A module that reports the bits without the exports is refused, because that
  * combination means the module is not the one it claims to be.
  */
+// `requireExport` for a function the family may have grown since the module was built.
+function optionalExport(
+  raw: WebAssembly.Exports,
+  name: string,
+): ((...args: number[]) => number) | undefined {
+  const value = raw[name];
+  return typeof value === "function" ? (value as (...args: number[]) => number) : undefined;
+}
+
 function bindModelFamily(raw: WebAssembly.Exports): ModelExports | undefined {
   const features = (raw["qw_features"] as (() => number) | undefined)?.() ?? 0;
   const wanted = (features & (FEATURE.model | FEATURE.decode)) === 
@@ -216,6 +234,8 @@ function bindModelFamily(raw: WebAssembly.Exports): ModelExports | undefined {
     qw_model_add_shard: requireExport(raw, "qw_model_add_shard"),
     qw_model_finish: requireExport(raw, "qw_model_finish"),
     qw_model_requirements: requireExport(raw, "qw_model_requirements"),
+    qw_model_tensor_count: optionalExport(raw, "qw_model_tensor_count"),
+    qw_model_tensor_descriptor: optionalExport(raw, "qw_model_tensor_descriptor"),
     qw_decode_begin: requireExport(raw, "qw_decode_begin"),
     qw_decode_step: requireExport(raw, "qw_decode_step"),
     qw_decode_tokens: requireExport(raw, "qw_decode_tokens"),
@@ -841,6 +861,63 @@ export class WasmCore {
         "qw_model_requirements",
       );
       return readModelRequirements(result.dataView(), 0);
+    } finally {
+      result.dispose();
+    }
+  }
+
+  /**
+   * How many tensors the loaded model holds, across every shard.
+   *
+   * This is the bound to enumerate against; a module built before tensor enumeration reports that it
+   * cannot answer rather than returning a wrong zero.
+   */
+  modelTensorCount(): number {
+    const model = this.modelExports("qw_model_tensor_count");
+    const call = model.qw_model_tensor_count;
+    if (call === undefined) {
+      throw new QwenscriberError(STATUS.unsupported, "qw_model_tensor_count", {
+        message: "this module was built before the model family could enumerate tensors",
+        context: {},
+      });
+    }
+    const result = this.alloc(Uint32Array.BYTES_PER_ELEMENT, 4);
+    try {
+      this.check(call(this.handleValue, result.pointer), "qw_model_tensor_count");
+      return result.dataView().getUint32(0, true);
+    } finally {
+      result.dispose();
+    }
+  }
+
+  /**
+   * Where one tensor's bytes are, by position in that enumeration.
+   *
+   * The offset is absolute within the shard `shard_index` names, so the caller slices the bytes it
+   * already holds instead of decoding the container's header.
+   */
+  modelTensorDescriptor(index: number): TensorDescriptor {
+    const model = this.modelExports("qw_model_tensor_descriptor");
+    const call = model.qw_model_tensor_descriptor;
+    if (call === undefined) {
+      throw new QwenscriberError(STATUS.unsupported, "qw_model_tensor_descriptor", {
+        message: "this module was built before the model family could enumerate tensors",
+        context: { index },
+      });
+    }
+    if (!Number.isInteger(index) || index < 0) {
+      throw new QwenscriberError(STATUS.invalid_argument, "qw_model_tensor_descriptor", {
+        message: `a descriptor index must be a non-negative integer, got ${index}`,
+        context: { index },
+      });
+    }
+    const result = this.alloc(TENSOR_DESCRIPTOR_BYTES, 8);
+    try {
+      this.check(
+        call(this.handleValue, index, result.pointer),
+        "qw_model_tensor_descriptor",
+      );
+      return readTensorDescriptor(result.dataView(), 0);
     } finally {
       result.dispose();
     }

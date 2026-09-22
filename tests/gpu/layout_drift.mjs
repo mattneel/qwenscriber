@@ -34,6 +34,8 @@ const zig_quant_path = "src/core/quant.zig";
 const zig_dtype_path = "src/core/dtype.zig";
 const zig_container_path = "src/core/container.zig";
 const tensor_kind_path = "packages/qwenscriber/src/gpu/tensor_kind.ts";
+const abi_zig_path = "src/wasm/abi.zig";
+const abi_ts_path = "packages/qwenscriber/src/wasm/abi.ts";
 const layout_path = "gpu/shaders/quant_layout.wgsl";
 const shader_dir = "gpu/shaders";
 
@@ -414,17 +416,106 @@ function compare_tensor_kinds() {
     return { rows, problems };
 }
 
+// The ABI structs are the other place two languages have to agree on numbers. Zig pins its own
+// layout with comptime asserts; this compares those asserts against the DataView offsets the SDK
+// reads with, so a field reordered on either side fails here rather than reading the neighbouring
+// field in a browser.
+const ABI_STRUCTS = [
+    {
+        name: "TensorDescriptor",
+        size: "TENSOR_DESCRIPTOR_BYTES",
+        offsets: "TENSOR_DESCRIPTOR_OFFSET",
+    },
+    {
+        name: "ModelRequirements",
+        size: "MODEL_REQUIREMENTS_BYTES",
+        offsets: "MODEL_REQUIREMENTS_OFFSET",
+    },
+];
+
+// One offset table's body. Field names repeat across tables -- `reserved` is in several -- so the
+// search has to stay inside the table named, or it reads a neighbouring struct's number.
+function ts_offset_block(text, table) {
+    const start = text.indexOf(`${table} = {`);
+    if (start < 0) return null;
+    const end = text.indexOf("}", start);
+    return end < 0 ? null : text.slice(start, end);
+}
+
+// Every field Zig asserts an offset for, in the order the asserts appear.
+function zig_abi_fields(text, struct) {
+    const pattern = new RegExp(`@offsetOf\\(${struct}, "(\\w+)"\\) == (\\d+)`, "g");
+    return [...text.matchAll(pattern)].map((match) => ({ name: match[1], offset: match[2] }));
+}
+
+function compare_abi_layout() {
+    const rows = [];
+    const problems = [];
+    const zig = source_text(abi_zig_path);
+    const ts = source_text(abi_ts_path);
+
+    for (const struct of ABI_STRUCTS) {
+        const fields = zig_abi_fields(zig, struct.name);
+        if (fields.length === 0) {
+            problems.push(`abi layout: ${abi_zig_path} no longer asserts offsets for ${struct.name}`);
+            continue;
+        }
+        const zig_size = zig.match(new RegExp(`@sizeOf\\(${struct.name}\\) == (\\d+)`));
+        const ts_size = ts.match(new RegExp(`${struct.size} = (\\d+)`));
+        if (zig_size === null || ts_size === null) {
+            problems.push(
+                `abi layout: ${struct.name} size is pinned in ` +
+                    `${zig_size === null ? abi_zig_path : abi_ts_path} only`,
+            );
+        } else if (zig_size[1] !== ts_size[1]) {
+            problems.push(
+                `abi layout: ${struct.name} is ${zig_size[1]} bytes in ${abi_zig_path} and ` +
+                    `${ts_size[1]} in ${abi_ts_path}`,
+            );
+        }
+
+        const table = ts_offset_block(ts, struct.offsets);
+        if (table === null) {
+            problems.push(`abi layout: ${abi_ts_path} no longer declares ${struct.offsets}`);
+            continue;
+        }
+
+        let compared = 0;
+        for (const field of fields) {
+            const in_ts = table.match(new RegExp(`^\\s*${field.name}: (\\d+),`, "m"));
+            if (in_ts === null) {
+                problems.push(
+                    `abi layout: ${struct.name}.${field.name} is at ${field.offset} in ` +
+                        `${abi_zig_path} and is not pinned in ${struct.offsets}`,
+                );
+                continue;
+            }
+            compared += 1;
+            if (in_ts[1] !== field.offset) {
+                problems.push(
+                    `abi layout: ${struct.name}.${field.name} is at ${field.offset} in ` +
+                        `${abi_zig_path} and ${in_ts[1]} in ${abi_ts_path}`,
+                );
+            }
+        }
+        rows.push({ name: struct.name, detail: `${compared} field offsets agree` });
+    }
+    return { rows, problems };
+}
+
 const layout = wgsl_constants(source_text(layout_path));
 const compared = compare_layout();
 const structure = check_structure(layout);
 const mirrors = check_kernel_mirrors(layout);
 const kinds = compare_tensor_kinds();
+const abi_layout = compare_abi_layout();
 
 const problems = [
     ...compared.problems,
     ...structure.problems,
     ...mirrors.problems,
     ...kinds.problems,
+    ...abi_layout.problems,
 ];
 const shader_count = new Set(mirrors.mirrors.map((mirror) => mirror.file)).size;
 
@@ -446,6 +537,10 @@ console.log(
     `layout_drift: tensor kinds compared between ${zig_container_path} and ${tensor_kind_path}`,
 );
 for (const row of kinds.rows) {
+    console.log(`  ${row.name}: ${row.detail}`);
+}
+console.log(`layout_drift: ABI struct layout compared between ${abi_zig_path} and ${abi_ts_path}`);
+for (const row of abi_layout.rows) {
     console.log(`  ${row.name}: ${row.detail}`);
 }
 

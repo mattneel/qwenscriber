@@ -326,6 +326,66 @@ export const FEATURE_NAMES: readonly FeatureName[] = [
 export const FEATURE_ALL: number = FEATURE_NAMES.reduce((mask, name) => mask | FEATURE[name], 0);
 
 // ---------------------------------------------------------------------------
+// Tensor descriptors (`qw_model_tensor_count`, `qw_model_tensor_descriptor`,
+// abi.TensorDescriptor). Offsets mirror `src/wasm/abi.zig`, whose comptime asserts
+// pin the same numbers, and the kind values a descriptor reports are in
+// `../gpu/tensor_kind.ts`, which `tests/gpu/layout_drift.mjs` checks against the
+// container's own enum.
+
+/** `abi.TensorDescriptor`: where one tensor's bytes are and what they mean. 64 bytes, 8-byte aligned. */
+export const TENSOR_DESCRIPTOR_BYTES = 64;
+export const TENSOR_DESCRIPTOR_OFFSET = {
+  offset_bytes: 0,
+  len_bytes: 8,
+  kind: 16,
+  layer: 20,
+  format: 24,
+  rank: 28,
+  dims: 32,
+  shard_index: 48,
+  reserved_0: 52,
+  reserved_1: 56,
+  reserved_2: 60,
+} as const;
+
+/**
+ * One tensor of a loaded model.
+ *
+ * `offset_bytes` is absolute within the shard named by `shard_index`, so a caller holding the shard
+ * bytes needs nothing else from the container. `dims` carries four entries with only `rank` of them
+ * live, matching the container's fixed-width entry.
+ */
+export interface TensorDescriptor {
+  readonly offset_bytes: number;
+  readonly len_bytes: number;
+  readonly kind: number;
+  readonly layer: number;
+  readonly format: number;
+  readonly rank: number;
+  readonly dims: readonly [number, number, number, number];
+  readonly shard_index: number;
+}
+
+export function readTensorDescriptor(view: DataView, offset = 0): TensorDescriptor {
+  const dims_offset = offset + TENSOR_DESCRIPTOR_OFFSET.dims;
+  return {
+    offset_bytes: Number(view.getBigUint64(offset + TENSOR_DESCRIPTOR_OFFSET.offset_bytes, true)),
+    len_bytes: Number(view.getBigUint64(offset + TENSOR_DESCRIPTOR_OFFSET.len_bytes, true)),
+    kind: view.getUint32(offset + TENSOR_DESCRIPTOR_OFFSET.kind, true),
+    layer: view.getUint32(offset + TENSOR_DESCRIPTOR_OFFSET.layer, true),
+    format: view.getUint32(offset + TENSOR_DESCRIPTOR_OFFSET.format, true),
+    rank: view.getUint32(offset + TENSOR_DESCRIPTOR_OFFSET.rank, true),
+    dims: [
+      view.getUint32(dims_offset, true),
+      view.getUint32(dims_offset + 4, true),
+      view.getUint32(dims_offset + 8, true),
+      view.getUint32(dims_offset + 12, true),
+    ],
+    shard_index: view.getUint32(offset + TENSOR_DESCRIPTOR_OFFSET.shard_index, true),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Model requirements (`qw_model_requirements`, abi.ModelRequirements)
 // ---------------------------------------------------------------------------
 
