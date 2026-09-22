@@ -10,8 +10,15 @@ time the preprocessing path, and — when the browser has a WebGPU adapter — a
 uploads against its real limits, and run `matmul_q4` against the same CPU reference the GPU harness
 uses.
 
-What it does **not** do: produce a transcript. Model loading and decode are not in ABI v1 yet, so the
-last section shows the typed error that says so rather than a plausible-looking fake.
+What it does **not** do: produce a transcript — not because the runtime cannot, but because a
+transcript needs a converted model directory of several hundred megabytes and the book ships no model
+artifacts. The decode path is exercised by `packages/qwenscriber/test/decode_model.test.ts` against a
+converted checkpoint on a machine that has one; the last section of the page shows the typed error a
+caller gets without one, rather than a plausible-looking fake.
+
+The page also reports the adapter it actually got and the upload plan for a deliberately impossible
+manifest, because "how many buffers does a quantized 1.7B model need" is the question that decides
+whether a browser can load it at all.
 
 <iframe
   src="demo/index.html"
