@@ -5,10 +5,12 @@
 //! long clip never blocks a page. Detokenization and the core's self-test are exposed for the same
 //! reason: they are stages ABI v1 actually implements.
 //!
-//! What does not work yet is stated rather than simulated. There is no encoder and no decoder in
-//! ABI v1, so `transcribe()` runs the front end, then throws `NotImplementedError` naming the
-//! missing stage and carrying the preprocessing that did happen. Nothing here ever returns invented
-//! text, and no method silently degrades into a slower path.
+//! What does not work yet is stated rather than simulated. ABI v1 now loads a converted model and
+//! decodes with it -- `WasmCore` exposes `qw_model_*`/`qw_decode_*` and `decode.ts` drives a whole
+//! model directory -- but this facade still loads no model, so `transcribe()` runs the front end and
+//! then throws `NotImplementedError` saying that no converted model directory is loaded, and
+//! carrying the preprocessing that did happen. Nothing here ever returns invented text, and no
+//! method silently degrades into a slower path.
 
 import { STATUS } from "./wasm/abi.ts";
 import { NotImplementedError, QwenscriberError, SDK_STATUS } from "./errors.ts";
@@ -173,12 +175,14 @@ export class Qwenscriber {
   }
 
   /**
-   * Preprocesses the clip, then reports that decoding does not exist yet.
+   * Preprocesses the clip, then reports that no model is loaded.
    *
-   * Always rejects with `NotImplementedError` (`code === SDK_STATUS.not_implemented`). The front end
-   * genuinely ran first -- frame count, padding value, and the audio metadata are in the error's
-   * `context` -- because "the half that exists worked, the other half is missing" is a more useful
-   * answer than a blanket failure. This method never returns a fabricated transcript.
+   * Always rejects with `NotImplementedError` (`code === SDK_STATUS.not_implemented`). The ABI can
+   * decode now, but a transcript needs a converted model directory resident in the core's linear
+   * memory, and this facade has no model to decode with. The front end genuinely ran first -- frame
+   * count, padding value, and the audio metadata are in the error's `context` -- because "the half
+   * that exists worked, the other half is missing" is a more useful answer than a blanket failure.
+   * This method never returns a fabricated transcript.
    */
   async transcribe(audio: AudioInput, options: DecodeOptions = {}): Promise<never> {
     this.assertUsable("transcribe");
@@ -190,7 +194,7 @@ export class Qwenscriber {
         throw new NotImplementedError(error.feature, "transcribe", {
           message:
             `transcribe preprocessed ${decoded.frames} samples at ${decoded.sample_rate_hz} Hz and ` +
-            `stopped: the "${error.feature}" stage is not in ABI v1 ` +
+            `stopped: no converted model directory is loaded, so there is nothing to decode with ` +
             `(model ${this.modelValue}, backend ${this.backendValue}, ` +
             `quantization ${this.quantizationValue})`,
           context: {
@@ -257,12 +261,62 @@ export { SDK_STATUS, QwenscriberError, AbiMismatchError, NotImplementedError, is
 export {
   capabilities,
   probeWebGpu,
+  acquireAdapter,
+  gpuEntryPoint,
   WEBGPU_PROBE_TIMEOUT_MS,
+  type AdapterAcquisition,
   type Capabilities,
   type WebGpuAdapterInfo,
   type WebGpuCapability,
   type WebGpuLimits,
 } from "./capabilities.ts";
+export {
+  WebGpuRuntime,
+  type ShaderSource,
+  type WebGpuDispatchGeometry,
+  type WebGpuRuntimeCapability,
+  type WebGpuRuntimeOptions,
+} from "./gpu/runtime.ts";
+export {
+  matmulQ4,
+  Q4_CODE_BYTES_PER_GROUP,
+  Q4_GROUP_SIZE,
+  type MatmulQ4Request,
+  type MatmulQ4Result,
+} from "./gpu/matmul_q4.ts";
+export { shaderSourceFromBaseUrl } from "./gpu/shaders.ts";
+export {
+  WEBGPU_KERNELS,
+  bindGroupLayoutEntries,
+  type WebGpuKernelBinding,
+  type WebGpuKernelDescriptor,
+  type WebGpuKernelName,
+} from "./gpu/kernels.ts";
+export {
+  measuredLimits,
+  requireLimits,
+  shortfallsFor,
+  type WebGpuRequirements,
+} from "./gpu/limits.ts";
+export {
+  partCapacityOf,
+  planUpload,
+  type WebGpuBufferPlan,
+  type WebGpuShardPlacement,
+  type WebGpuShardPlan,
+  type WebGpuUploadPlan,
+  type WebGpuUploadPlanLimits,
+} from "./gpu/upload_plan.ts";
+export {
+  GpuError,
+  GpuDeviceError,
+  GpuLimitsError,
+  GpuShaderError,
+  GpuSoftwareAdapterError,
+  GpuUnavailableError,
+  isGpuError,
+  type GpuLimitShortfall,
+} from "./gpu/errors.ts";
 export {
   WasmCore,
   Allocation,
@@ -292,6 +346,16 @@ export {
   type PcmFormat,
 } from "./audio/pcm.ts";
 export { resample } from "./audio/resample.ts";
+export {
+  CAPTURE_BLOCK_FRAMES,
+  CAPTURE_BLOCKS_IN_FLIGHT_MAX,
+  CAPTURE_SAMPLES_MAX,
+  CAPTURE_WORKLET_SOURCE,
+  CaptureQueue,
+  MicrophoneCapture,
+  type CaptureOptions,
+  type CaptureState,
+} from "./audio/capture.ts";
 export { looksLikeWave, readWave, type WaveAudio } from "./audio/wav.ts";
 export type {
   AudioSourceKind,

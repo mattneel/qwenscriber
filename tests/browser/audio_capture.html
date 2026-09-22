@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Qwenscriber capture harness</title>
+  </head>
+  <body>
+    <p>
+      Runs the SDK's microphone capture path against a synthetic stream, so no microphone and no
+      permission are involved. The click is a user gesture, which is what lets the browsers start an
+      audio context. Results land in <code>window.__result</code>.
+    </p>
+    <button id="start" type="button">start</button>
+    <pre id="out"></pre>
+    <script type="module" src="./audio_capture.mjs"></script>
+  </body>
+</html>

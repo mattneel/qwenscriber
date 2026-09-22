@@ -66,9 +66,49 @@ The SDK maps numeric core errors and host failures to typed JavaScript errors wi
 human-readable message, operation context, and a preserved cause when one exists. Applications must
 not parse error-message prose to make decisions.
 
+## Microphone capture
+
+Realtime input is implemented, and it is deliberately narrower than `stream()`. `MicrophoneCapture`
+turns a microphone, or any `MediaStream` a caller already owns, into mono f32 samples:
+
+```ts
+const capture = await MicrophoneCapture.start(); // acquires a microphone
+// or: await MicrophoneCapture.attach(stream);   // borrows one the caller owns
+
+let chunk = capture.read(16000); // up to one second of mono f32
+if (!capture.isNativeRate) {
+  chunk = resample(chunk, capture.state.input_rate_hz, 16000);
+}
+
+const { dropped_samples, dropped_blocks } = capture.state; // what was thrown away, and how much
+await capture.stop(); // detaches; stops the microphone only if this session acquired it
+```
+
+Every stage between the audio thread and the reader is bounded, and each bound reports what it cost:
+
+| Stage | Bound | When it is reached |
+| --- | --- | --- |
+| Worklet send | `CAPTURE_BLOCKS_IN_FLIGHT_MAX` blocks, held by credit | the worklet drops the block and counts it in `dropped_blocks` |
+| Sample queue | `CAPTURE_SAMPLES_MAX`, the core's own 30-second capacity | the oldest samples go, counted in `dropped_samples` |
+
+The reader grants one block of credit per block it consumes, so a stalled consumer cannot make the
+audio thread queue without limit. A caller that never reads loses the oldest audio, never memory, and
+can see that it happened.
+
+**The capture rate is the track's, not the context's.** Chromium grants the audio device's rate to an
+`AudioContext` even when 16 kHz is requested, and hands the worklet a `MediaStream` track at the
+track's own rate. The two disagree, and the samples follow the track, so `state.input_rate_hz` reports
+what they actually are while `state.context_rate_hz` reports what the context claimed. Convert with
+`resample` whenever `isNativeRate` is false. Believing the context's rate is what made this path
+produce audio three times too fast the first time it was measured in a browser.
+
+Acquiring a microphone needs a user gesture in most browsers, so `start()` belongs in a click or
+keypress handler; a rejection from the user, or from a page without permission, reaches the caller
+unchanged.
+
 ## Streaming
 
-`stream()` is planned after non-streaming correctness. Its eventual contract must define
-backpressure, cancellation, partial/final segments, timestamps, audio queue bounds, and what happens
-when input outruns inference. No example in this book overrides that future contract.
+`stream()` — decoded segments as they are produced — is still planned. Its contract must define partial
+and final segments, timestamps, cancellation, and what happens when input outruns inference. The
+capture path above settles the audio-bounds half of that question and none of the rest.
 
