@@ -421,6 +421,38 @@ function compare_tensor_kinds() {
 // layout with comptime asserts; this compares those asserts against the DataView offsets the SDK
 // reads with, so a field reordered on either side fails here rather than reading the neighbouring
 // field in a browser.
+// The layer bases are tags in the container's index, and the SDK adds them when it looks a tower
+// layer up, so a silent renumbering would send every lookup to the wrong block.
+const LAYER_BASES = [
+    { ts: "DECODER_LAYER_BASE = (\\d+)", zig: "/pub const decoder_layer_base: u16 = (\\d+);/", source: "src/core/qwen3_asr/layout.zig" },
+    { ts: "AUDIO_LAYER_BASE = (\\d+)", zig: "/pub const audio_layer_base: u16 = (\\d+);/", source: "src/core/container.zig" },
+];
+
+function compare_layer_bases() {
+    const problems = [];
+    const ts = source_text(tensor_kind_path);
+    let compared = 0;
+    for (const base of LAYER_BASES) {
+        const mirrored = ts_constant(ts, base.ts);
+        const zig = zig_constant(source_text(base.source), base.zig);
+        if (mirrored === undefined || zig === undefined) {
+            problems.push(`layer bases: ${base.ts} is not pinned in both files`);
+            continue;
+        }
+        compared += 1;
+        if (mirrored !== zig) {
+            problems.push(
+                `layer bases: ${base.ts.match(/^(\w+)/)[1]} is ${mirrored} in ${tensor_kind_path} ` +
+                    `and ${zig} in ${base.source}`,
+            );
+        }
+    }
+    return {
+        rows: [{ name: "layer bases", detail: `${compared} bases agree with the container` }],
+        problems,
+    };
+}
+
 const ABI_STRUCTS = [
     {
         name: "TensorDescriptor",
@@ -628,6 +660,7 @@ const mirrors = check_kernel_mirrors(layout);
 const kinds = compare_tensor_kinds();
 const abi_layout = compare_abi_layout();
 const quant_ts = compare_quant_ts();
+const layer_bases = compare_layer_bases();
 
 const problems = [
     ...compared.problems,
@@ -636,6 +669,7 @@ const problems = [
     ...kinds.problems,
     ...abi_layout.problems,
     ...quant_ts.problems,
+    ...layer_bases.problems,
 ];
 const shader_count = new Set(mirrors.mirrors.map((mirror) => mirror.file)).size;
 
@@ -661,6 +695,9 @@ for (const row of kinds.rows) {
 }
 console.log(`layout_drift: constants compared between ${layout_path} and ${quant_ts_path}`);
 for (const row of quant_ts.rows) {
+    console.log(`  ${row.name}: ${row.detail}`);
+}
+for (const row of layer_bases.rows) {
     console.log(`  ${row.name}: ${row.detail}`);
 }
 console.log(`layout_drift: ABI struct layout compared between ${abi_zig_path} and ${abi_ts_path}`);

@@ -18,6 +18,7 @@ import { read_fixture } from "./fixture.mjs";
 // Test-side modules on purpose: the check drives the runtime below the public SDK surface, the same
 // way the kernel harness imports `reference.mjs` rather than going through a package.
 import { runConvStage } from "../../packages/qwenscriber/dist/gpu/conv_stack.js";
+import { runAudioTower, uploadAudioTowerWeights, windowSteps } from "../../packages/qwenscriber/dist/gpu/audio_tower.js";
 import { WebGpuRuntime } from "../../packages/qwenscriber/dist/gpu/runtime.js";
 import { shaderSourceFromBaseUrl } from "../../packages/qwenscriber/dist/gpu/shaders.js";
 import { uploadTowerWeights } from "../../packages/qwenscriber/dist/gpu/tower_weights.js";
@@ -71,6 +72,33 @@ function compare(actual, expected, atol, rtol) {
     return { max_abs, mean_abs: sum_abs / expected.length, failures, worst_index };
 }
 
+/**
+ * The steps one chunk contributes: the convolution stack's depth applied to the chunk's *valid*
+ * frames, which is what `packedStepCount` does per chunk in the configuration.
+ */
+function validSteps(frames) {
+    let steps = frames;
+    for (let index = 0; index < 3; index += 1) steps = Math.floor((steps - 1) / 2) + 1;
+    return steps;
+}
+
+/**
+ * The comparison `tools/reference/compare_fixtures.py` sanctions for `audio_encoded`: the worst
+ * absolute difference against the tensor's own scale, not element by element.
+ *
+ * The reason is in that script: one element of the reference near zero turns a per-element relative
+ * error into a huge number while the tensor as a whole agrees to a millionth.
+ */
+function scaleRelative(actual, expected) {
+    let worst = 0;
+    for (let index = 0; index < expected.length; index += 1) {
+        worst = Math.max(worst, Math.abs(actual[index] - expected[index]));
+    }
+    let scale = 0;
+    for (const value of expected) scale = Math.max(scale, Math.abs(value));
+    return { worst, scale, relative: scale === 0 ? worst : worst / scale };
+}
+
 export async function run() {
     const notes = [];
     const rows = [];
@@ -96,8 +124,11 @@ export async function run() {
 
     const features = await load_fixture(`${FIXTURE_URL}input_features.f32`);
     const expected = await load_fixture(`${FIXTURE_URL}audio_conv_out.f32`);
-    notes.push(`fixtures: input_features ${features.dims.join("x")}, audio_conv_out ` +
-        `${expected.dims.join("x")}`);
+    const encoded = await load_fixture(`${FIXTURE_URL}audio_encoded.f32`);
+    notes.push(
+        `fixtures: input_features ${features.dims.join("x")}, audio_conv_out ` +
+            `${expected.dims.join("x")}, audio_encoded ${encoded.dims.join("x")}`,
+    );
 
     const runtime = await WebGpuRuntime.create({
         shaderSource: shaderSourceFromBaseUrl(new URL("/gpu/shaders/", location.href)),
@@ -213,6 +244,123 @@ export async function run() {
         `conv stack: expected ${expected.dims[0]}x${expected.dims[1]}, got ` +
         `${result.steps}x${result.d_model}`,
     );
+    // The blocks read the whole packed sequence, so the convolution stage runs once per chunk and
+    // only the steps that belong to valid mel frames are kept.
+    // The tail of a short chunk is zeros, not the mel padding value: the core's `convolveAndPack`
+    // memsets the chunk before copying the frames it has, and its comment says why -- the reference
+    // pads with zeros in the mel domain, and the padding *value* belongs to the frontend's buffer
+    // past the audio, where the zeros live in the audio itself.
+    const chunk_count = Math.ceil(features.dims[1] / config.chunk_frames);
+    // Counted per chunk, not over the whole clip: the convolution depth is applied to each chunk's
+    // valid frames, so 420 frames are 13+13+13+13+3 = 55 steps rather than the 53 a single
+    // application of the same arithmetic to 420 would give. The dump's 55 rows say which is right.
+    let declared_steps = 0;
+    for (let index = 0; index < chunk_count; index += 1) {
+        const valid = Math.min(config.chunk_frames, features.dims[1] - index * config.chunk_frames);
+        declared_steps += validSteps(valid);
+    }
+    const packed = new Float32Array(declared_steps * config.d_model);
+    let packed_steps = 0;
+    for (let index = 0; index < chunk_count; index += 1) {
+        const first_frame = index * config.chunk_frames;
+        const valid = Math.min(config.chunk_frames, features.dims[1] - first_frame);
+        const block = new Float32Array(config.mel_bins * config.chunk_frames);
+        for (let bin = 0; bin < config.mel_bins; bin += 1) {
+            for (let frame = 0; frame < valid; frame += 1) {
+                block[bin * config.chunk_frames + frame] =
+                    features.values[bin * features.dims[1] + first_frame + frame];
+            }
+        }
+        const chunk_result = await runConvStage(runtime, weights, config, block);
+        const values = await runtime.readFloats(
+            chunk_result.output,
+            chunk_result.steps * result.d_model,
+        );
+        chunk_result.output.destroy();
+        const keep = validSteps(valid);
+        packed.set(values.subarray(0, keep * result.d_model), packed_steps * result.d_model);
+        packed_steps += keep;
+    }
+    notes.push(
+        `packing: ${chunk_count} chunks over ${features.dims[1]} mel frames -> ${packed_steps} ` +
+            `steps (the dump has ${encoded.dims[0]})`,
+    );
+
+    const tower_weights = uploadAudioTowerWeights(runtime, model, config);
+    const tower_input = runtime.uploadBytes(new Uint8Array(packed.buffer), "tower.encoder.input");
+    const tower_started = performance.now();
+    const tower = await runAudioTower(runtime, tower_weights, config, tower_input, packed_steps);
+    const tower_ms = performance.now() - tower_started;
+    const encoded_values = await runtime.readFloats(tower.output, packed_steps * config.d_model);
+    tower.output.destroy();
+    const blocks_relative = scaleRelative(encoded_values, encoded.values);
+    // The released implementation's own `audio_encoded` for the same clip, which the q5 dump was
+    // already held to by `tools/reference/compare_fixtures.py`. Comparing both distances says
+    // whether a disagreement is this tower's arithmetic or the quantization the dump itself carries:
+    // an output closer to the dump than the dump is to the reference is as good as this check can be.
+    let reference_gap = null;
+    try {
+        const reference = await load_fixture("/tests/fixtures/reference/audio_encoded.f32");
+        const dump_to_reference = scaleRelative(encoded.values, reference.values);
+        const ours_to_reference = scaleRelative(encoded_values, reference.values);
+        reference_gap = { dump_to_reference, ours_to_reference };
+        notes.push(
+            `against the released implementation: dump ${dump_to_reference.relative.toExponential(2)}, ` +
+                `ours ${ours_to_reference.relative.toExponential(2)}`,
+        );
+    } catch (error) {
+        notes.push(`no released-implementation fixture to compare against: ${error.message}`);
+    }
+    const blocks = compare(encoded_values, encoded.values, 0, 2e-2);
+    notes.push(
+        `blocks (scale relative): max|d| ${blocks_relative.worst.toExponential(2)} over scale ` +
+            `${blocks_relative.scale.toExponential(2)} = ${blocks_relative.relative.toExponential(2)}`,
+    );
+    notes.push(
+        `blocks: ${tower.dispatches.length} dispatches in ${tower_ms.toFixed(1)} ms, one window ` +
+            `of ${windowSteps(config)} steps`,
+    );
+    notes.push(
+        `magnitude: encoded ours ${max_abs(encoded_values).toExponential(3)}, dump ` +
+            `${max_abs(encoded.values).toExponential(3)}`,
+    );
+    if (blocks.failures > 0) {
+        notes.push(
+            `blocks worst index ${blocks.worst_index}: ours ${encoded_values[blocks.worst_index]}, ` +
+                `dump ${encoded.values[blocks.worst_index]}`,
+        );
+        // Which steps disagree, and by how much: a per-step profile says whether the difference is
+        // one wrong region -- a chunk boundary, a padded tail -- or spread evenly, which would be a
+        // pass applied differently rather than an input being wrong.
+        const per_step = [];
+        let step_starts = 0;
+        for (let index = 0; index < chunk_count; index += 1) {
+            const valid = Math.min(
+                config.chunk_frames,
+                features.dims[1] - index * config.chunk_frames,
+            );
+            const keep = validSteps(valid);
+            let worst = 0;
+            let failed = 0;
+            // The same scale as the whole-tensor comparison, so a chunk's share of the error is
+            // readable on its own rather than against its own local scale.
+            for (let step = step_starts; step < step_starts + keep; step += 1) {
+                for (let column = 0; column < config.d_model; column += 1) {
+                    const at = step * config.d_model + column;
+                    const difference = Math.abs(encoded_values[at] - encoded.values[at]);
+                    worst = Math.max(worst, difference);
+                    if (difference > 2e-2 * blocks_relative.scale) failed += 1;
+                }
+            }
+            per_step.push(
+                `chunk ${index}: steps ${step_starts}..${step_starts + keep - 1} ` +
+                    `max|d| ${worst.toExponential(2)} over-tolerance ${failed}/${keep * config.d_model}`,
+            );
+            step_starts += keep;
+        }
+        notes.push(...per_step);
+    }
+
     rows.push({
         name: "conv_stack + conv_out",
         status: comparison.failures === 0 ? "pass" : "fail",
@@ -238,5 +386,14 @@ export async function run() {
         `worst index ${comparison.worst_index}: ours ${actual[comparison.worst_index]}, ` +
         `dump ${expected.values[comparison.worst_index]}`,
     );
-    return { adapter: info, limits, rows, notes, ok: comparison.failures === 0 };
+    rows.push({
+        name: "audio_tower blocks",
+        status: blocks_relative.relative <= 2e-2 ? "pass" : "fail",
+        elements: encoded.values.length,
+        max_abs: blocks_relative.worst,
+        mean_abs: blocks.mean_abs,
+        failures: blocks.failures,
+    });
+    const ok = comparison.failures === 0 && blocks_relative.relative <= 2e-2;
+    return { adapter: info, limits, rows, notes, ok };
 }

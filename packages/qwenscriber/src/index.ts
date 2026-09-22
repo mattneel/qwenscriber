@@ -288,6 +288,15 @@ export { shaderSourceFromBaseUrl } from "./gpu/shaders.ts";
 export { TENSOR_KIND, type TensorKind, type TensorKindName } from "./gpu/tensor_kind.ts";
 export { positionEmbedding, runConvStage, type ConvStageResult } from "./gpu/conv_stack.ts";
 export {
+  runAudioTower,
+  uploadAudioTowerWeights,
+  windowSteps,
+  type AudioLayerWeights,
+  type AudioTowerResult,
+  type AudioTowerWeights,
+  type ProjectionWeights,
+} from "./gpu/audio_tower.ts";
+export {
   FORMAT_Q4,
   FORMAT_Q5,
   FORMAT_Q8,

@@ -56,6 +56,17 @@ export const TENSOR_KIND = {
   decoder_layer_ffn_down_weight: 43,
 } as const;
 
+/**
+ * Layer numbering, from `src/core/container.zig`: zero for tensors that belong to no layer,
+ * `DECODER_LAYER_BASE..` for decoder layers, and `AUDIO_LAYER_BASE + i` for audio tower layers.
+ *
+ * The bases are tags rather than offsets -- 1024 keeps the tower's blocks clear of any decoder a
+ * released checkpoint could have -- so a caller looking for the tower's layer `i` has to add the
+ * base, and a caller that forgets finds nothing at all rather than the wrong weights.
+ */
+export const DECODER_LAYER_BASE = 1;
+export const AUDIO_LAYER_BASE = 1024;
+
 /** A kind's name, as the container spells it. */
 export type TensorKindName = keyof typeof TENSOR_KIND;
 
