@@ -18,6 +18,7 @@
 //! that was regenerated with different options does not present itself as the one that was
 //! requested.
 
+import type { TensorDescriptor } from "./wasm/abi.ts";
 import {
   MODEL_CONFIG_BYTES,
   SHARD_ALIGNMENT,
@@ -329,6 +330,64 @@ export class WasmModel {
       decodeBudget(options.maxTokens, this.requirements),
     );
     return { tokens, text: this.core.detokenize(tokens) };
+  }
+
+  /** Descriptors by `${kind}:${layer}`, built the first time a tensor is asked for. */
+  private tensorIndexValue: ReadonlyMap<string, TensorDescriptor> | undefined;
+
+  private tensorIndex(): ReadonlyMap<string, TensorDescriptor> {
+    if (this.tensorIndexValue !== undefined) return this.tensorIndexValue;
+    const index = new Map<string, TensorDescriptor>();
+    const count = this.core.modelTensorCount();
+    for (let position = 0; position < count; position += 1) {
+      const descriptor = this.core.modelTensorDescriptor(position);
+      index.set(`${descriptor.kind}:${descriptor.layer}`, descriptor);
+    }
+    this.tensorIndexValue = index;
+    return index;
+  }
+
+  /**
+   * One tensor's descriptor and the bytes of its payload, or `undefined` when no shard holds it.
+   *
+   * The bytes are a fresh view into the shard's linear-memory buffer, not a copy: the runtime hands
+   * weights to the GPU by reading them, and copying 426 MB through a JavaScript array to reach
+   * `writeBuffer` is exactly the traffic this design avoids. The view is valid until the next
+   * allocation grows memory, which is the window a single upload needs; a caller that keeps it past
+   * that has to copy it.
+   */
+  tensor(
+    kind: number,
+    layer = 0,
+  ): { readonly descriptor: TensorDescriptor; readonly bytes: Uint8Array } | undefined {
+    if (this.released) {
+      throw new QwenscriberError(SDK_STATUS.protocol, "tensor", {
+        message: "this model was released; load it again",
+        context: { model: this.modelId },
+      });
+    }
+    const descriptor = this.tensorIndex().get(`${kind}:${layer}`);
+    if (descriptor === undefined) return undefined;
+    const shard = this.buffers[descriptor.shard_index];
+    if (shard === undefined || descriptor.offset_bytes + descriptor.len_bytes > shard.size) {
+      throw new QwenscriberError(SDK_STATUS.protocol, "tensor", {
+        message:
+          `tensor ${kind}:${layer} lies outside shard ${descriptor.shard_index}, which is ` +
+          `${shard === undefined ? "absent" : `${shard.size} bytes`}`,
+        context: {
+          kind,
+          layer,
+          shard: descriptor.shard_index,
+          offset_bytes: descriptor.offset_bytes,
+          len_bytes: descriptor.len_bytes,
+        },
+      });
+    }
+    const bytes = shard.bytes.subarray(
+      descriptor.offset_bytes,
+      descriptor.offset_bytes + descriptor.len_bytes,
+    );
+    return { descriptor, bytes };
   }
 
   /**

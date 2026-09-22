@@ -163,7 +163,9 @@ export class WebGpuRuntime {
     const adapter = acquisition.adapter as GPUAdapter;
     // A device starts at the specification's defaults, not at the adapter's capability, and some
     // kernels need the raised ones: workgroup storage stays at 16384 bytes unless the request asks
-    // for more, while the convolution kernel stages 18432 bytes of decoded 3x3 weights. Only `max`
+    // for more, while the convolution kernel stages 18432 bytes of decoded 3x3 weights. Not asking
+    // is worse than failing loudly: the first host this ran on created the pipeline, dispatched,
+    // and produced zeros, because the staging writes had nowhere to land. Only `max`
     // limits are requested. They are the ones an adapter can hand over; a `min` limit requested
     // below what the adapter reports is an invalid request rather than a stricter device.
     // `requireLimits` above has already reported any shortfall, so this request is the declared

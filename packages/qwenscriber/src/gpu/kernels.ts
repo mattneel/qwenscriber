@@ -227,9 +227,13 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
     file: "conv3x3_stride2_gelu.wgsl",
     entryPoint: "conv3x3_stride2_gelu_main",
     workgroupSize: [256, 1, 1],
-    // The decoded 3x3 weights for one output channel: 512 input channels * 9 taps * 4 bytes. This
-    // is the number that makes the kernel need a device limit above the specification's 16384-byte
-    // default, which `WebGpuRuntime.create` asks the adapter for when a caller declares it.
+    // The decoded 3x3 weights for one output channel: 512 input channels * 9 taps * 4 bytes. This is
+    // the number that makes the kernel need a device limit above the specification's 16384-byte
+    // default, so a caller must declare `maxComputeWorkgroupStorageSize` in `requiredLimits` --
+    // which `WebGpuRuntime.create` then asks the adapter for. An under-declared device does not
+    // necessarily fail: the host this was first run on created the pipeline, dispatched, and wrote
+    // zeros, because the staging writes had nowhere to go. A caller that sees a zero output from
+    // this kernel should check its declared limits before its input.
     workgroupStorageBytes: 512 * 9 * 4,
     bindings: [
       { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },

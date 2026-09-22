@@ -386,6 +386,81 @@ export function readTensorDescriptor(view: DataView, offset = 0): TensorDescript
 }
 
 // ---------------------------------------------------------------------------
+// Audio tower configuration (`qw_model_audio_config`, abi.AudioConfig)
+
+/**
+ * `abi.AudioConfig`: the audio tower's geometry. 72 bytes, 8-byte aligned.
+ *
+ * Every derived value is resolved by the core's own configuration helpers, so a dispatch built from
+ * these numbers cannot differ from the path the reference transcript came out of. `chunk_frames` is
+ * the mel frames one convolution chunk consumes, `chunk_steps` the time steps the stack emits for
+ * it, and `conv_out_input_features` the width of the downsample projection's input.
+ */
+export const AUDIO_CONFIG_BYTES = 72;
+export const AUDIO_CONFIG_OFFSET = {
+  d_model: 0,
+  layers: 4,
+  attention_heads: 8,
+  head_dim: 12,
+  ffn_dim: 16,
+  downsample_hidden_size: 20,
+  n_window: 24,
+  n_window_infer: 28,
+  chunk_frames: 32,
+  frequency_bins: 36,
+  conv_out_input_features: 40,
+  chunk_steps: 44,
+  max_position_steps: 48,
+  output_dim: 52,
+  mel_bins: 56,
+  layer_norm_eps: 60,
+  reserved_0: 64,
+  reserved_1: 68,
+} as const;
+
+export interface AudioConfig {
+  readonly d_model: number;
+  readonly layers: number;
+  readonly attention_heads: number;
+  readonly head_dim: number;
+  readonly ffn_dim: number;
+  readonly downsample_hidden_size: number;
+  readonly n_window: number;
+  readonly n_window_infer: number;
+  readonly chunk_frames: number;
+  readonly frequency_bins: number;
+  readonly conv_out_input_features: number;
+  readonly chunk_steps: number;
+  readonly max_position_steps: number;
+  readonly output_dim: number;
+  readonly mel_bins: number;
+  readonly layer_norm_eps: number;
+}
+
+export function readAudioConfig(view: DataView, offset = 0): AudioConfig {
+  const field = (name: keyof typeof AUDIO_CONFIG_OFFSET): number =>
+    view.getUint32(offset + AUDIO_CONFIG_OFFSET[name], true);
+  return {
+    d_model: field("d_model"),
+    layers: field("layers"),
+    attention_heads: field("attention_heads"),
+    head_dim: field("head_dim"),
+    ffn_dim: field("ffn_dim"),
+    downsample_hidden_size: field("downsample_hidden_size"),
+    n_window: field("n_window"),
+    n_window_infer: field("n_window_infer"),
+    chunk_frames: field("chunk_frames"),
+    frequency_bins: field("frequency_bins"),
+    conv_out_input_features: field("conv_out_input_features"),
+    chunk_steps: field("chunk_steps"),
+    max_position_steps: field("max_position_steps"),
+    output_dim: field("output_dim"),
+    mel_bins: field("mel_bins"),
+    layer_norm_eps: view.getFloat32(offset + AUDIO_CONFIG_OFFSET.layer_norm_eps, true),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Model requirements (`qw_model_requirements`, abi.ModelRequirements)
 // ---------------------------------------------------------------------------
 

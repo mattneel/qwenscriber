@@ -27,9 +27,12 @@ import {
   failedSelfTestChecks,
   readMelResult,
   readModelRequirements,
+  AUDIO_CONFIG_BYTES,
+  readAudioConfig,
   readSelfTestResult,
   writeTokenizerDescriptor,
   type Alignment,
+  type AudioConfig,
   type ModelRequirements,
   type TensorDescriptor,
   type TokenizerDescriptor,
@@ -103,6 +106,7 @@ interface ModelExports {
   qw_model_finish(handle: number, config_ptr: number, config_len: number): number;
   // Optional: a module built before tensor enumeration answers neither, and a caller that never
   // enumerates tensors is unaffected -- which is the model family's rule for growing in place.
+  qw_model_audio_config(handle: number, out_ptr: number): number;
   qw_model_tensor_count?: ((handle: number, out_ptr: number) => number) | undefined;
   qw_model_tensor_descriptor?:
     | ((handle: number, index: number, out_ptr: number) => number)
@@ -234,6 +238,7 @@ function bindModelFamily(raw: WebAssembly.Exports): ModelExports | undefined {
     qw_model_add_shard: requireExport(raw, "qw_model_add_shard"),
     qw_model_finish: requireExport(raw, "qw_model_finish"),
     qw_model_requirements: requireExport(raw, "qw_model_requirements"),
+    qw_model_audio_config: requireExport(raw, "qw_model_audio_config"),
     qw_model_tensor_count: optionalExport(raw, "qw_model_tensor_count"),
     qw_model_tensor_descriptor: optionalExport(raw, "qw_model_tensor_descriptor"),
     qw_decode_begin: requireExport(raw, "qw_decode_begin"),
@@ -861,6 +866,26 @@ export class WasmCore {
         "qw_model_requirements",
       );
       return readModelRequirements(result.dataView(), 0);
+    } finally {
+      result.dispose();
+    }
+  }
+
+  /**
+   * The audio tower's geometry: the dimensions a caller dispatching the tower itself needs.
+   *
+   * Every derived value comes from the core's own configuration helpers, so a dispatch cannot derive
+   * a different number than the reference transcript was produced with.
+   */
+  modelAudioConfig(): AudioConfig {
+    const model = this.modelExports("qw_model_audio_config");
+    const result = this.alloc(AUDIO_CONFIG_BYTES, 8);
+    try {
+      this.check(
+        model.qw_model_audio_config(this.handleValue, result.pointer),
+        "qw_model_audio_config",
+      );
+      return readAudioConfig(result.dataView(), 0);
     } finally {
       result.dispose();
     }

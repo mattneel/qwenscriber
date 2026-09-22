@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qwenscriber tower check</title>
+</head>
+<body>
+<pre id="output">running…</pre>
+<script type="module">
+// The kernel harness's contract: publish `window.__result` and let `driver.mjs` print it, so this
+// page needs no driver of its own.
+import { run } from "./tower_page.mjs";
+
+const output = document.getElementById("output");
+try {
+    const result = await run();
+    const lines = [
+        `adapter: vendor=${result.adapter.vendor ?? "?"} ` +
+            `architecture=${result.adapter.architecture ?? "?"}`,
+        "kernel                status  elements  max_abs     mean_abs    failures",
+    ];
+    for (const row of result.rows) {
+        lines.push(
+            `${row.name.padEnd(21)} ${row.status.padEnd(7)} ` +
+                `${String(row.elements).padEnd(9)} ${row.max_abs.toExponential(2).padEnd(11)} ` +
+                `${row.mean_abs.toExponential(2).padEnd(11)} ${row.failures}`,
+        );
+    }
+    for (const note of result.notes) lines.push(note);
+    const table_text = lines.join("\n");
+    output.textContent = table_text;
+    window.__result = { ...result, table_text };
+} catch (error) {
+    const detail = `${error?.stack ?? error}`;
+    output.textContent = detail;
+    window.__result = { ok: false, rows: [], notes: [detail], table_text: detail };
+}
+</script>
+</body>
+</html>
