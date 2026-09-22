@@ -94,6 +94,7 @@ export const TOLERANCES = {
     transpose: { atol: 0, rtol: 0 },
     // One addition per element: expected bit exact.
     add: { atol: 0, rtol: 0 },
+    add_bias: { atol: 0, rtol: 0 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -266,6 +267,12 @@ function build_normalization_cases() {
     const transpose_rows = 480;
     const transpose_cols = 13;
     const transpose_input = ref.random_vector(transpose_rows * transpose_cols, 0x5eed_000f);
+    // 7 columns over 9 rows: neither divides the 256-lane workgroup, so the guard and the
+    // broadcast both run on a partial row.
+    const bias_rows = 9;
+    const bias_cols = 7;
+    const bias_target = ref.random_vector(bias_rows * bias_cols, 0x5eed_0012);
+    const bias_values = ref.random_vector(bias_cols, 0x5eed_0013);
     const add_left = ref.random_vector(SHAPE.silu_count, 0x5eed_0010);
     const add_right = ref.random_vector(SHAPE.silu_count, 0x5eed_0011);
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
@@ -414,6 +421,26 @@ function build_normalization_cases() {
             expected: Float32Array.from(add_left, (value, index) => value + add_right[index]),
             tolerance: TOLERANCES.add,
             detail: `count ${SHAPE.silu_count}`,
+        },
+        {
+            name: "add_bias_f32",
+            shader: "add_bias_f32.wgsl",
+            entry_point: "add_bias_f32_main",
+            workgroup: [256, 1, 1],
+            bindings: [
+                { uniform: pack_uniform([bias_rows, bias_cols, 0, 0]) },
+                { input: bias_values },
+                // The kernel adds in place, so the buffer it writes is the one it read: binding 2 is
+                // seeded with the values the addition starts from.
+                { output: bias_rows * bias_cols, seed: bias_target },
+            ],
+            dispatch: [ceil_div(bias_rows * bias_cols, 256), 1, 1],
+            expected: Float32Array.from(
+                bias_target,
+                (value, index) => value + bias_values[index % bias_cols],
+            ),
+            tolerance: TOLERANCES.add_bias,
+            detail: `target ${bias_rows}x${bias_cols}, bias ${bias_cols}, in place`,
         },
         {
             name: "transpose_f32",
@@ -746,10 +773,16 @@ function create_binding_buffer(device, binding) {
         device.queue.writeBuffer(buffer, 0, bytes);
         return buffer;
     }
-    return device.createBuffer({
+    const output = device.createBuffer({
         size: align_up(binding.output * 4, 4),
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
+    // A kernel that reads and writes the same buffer -- an in-place bias add, a residual -- needs
+    // its output seeded, because a fresh buffer holds whatever the driver left there.
+    if (binding.seed !== undefined) {
+        device.queue.writeBuffer(output, 0, binding.seed);
+    }
+    return output;
 }
 
 // Runs one case and compares it against its reference. `keep_values` attaches the
