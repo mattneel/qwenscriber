@@ -99,3 +99,32 @@ jobs:
           name: book
           path: docs/book
           if-no-files-found: error
+
+  pages:
+    name: Publish the book to GitHub Pages
+    # Publication is part of the pipeline (docs/src/development/releases.md step
+    # 10): deploy the book CI already built and validated, from the default
+    # branch only. Pull requests still get the artifact above for inspection.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: book
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: book
+          path: docs/book
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+      - id: deployment
+        uses: actions/deploy-pages@v4
