@@ -21,12 +21,14 @@
 const std = @import("std");
 const qw = @import("qwenscriber");
 const abi = @import("abi.zig");
+const model_mod = @import("model.zig");
 
 /// WebAssembly pages are 64 KiB.
 const page_bytes: u64 = 65536;
 
 const allocator = std.heap.wasm_allocator;
 const mel = qw.mel;
+const model_config = qw.model_config;
 const tokenizer = qw.tokenizer;
 const selftest = qw.selftest;
 
@@ -36,6 +38,10 @@ var created_handle: u32 = 0;
 /// A view over memory JavaScript owns; never freed by the runtime.
 var vocabulary: tokenizer.TokenTable = .{ .offsets = &.{}, .bytes = &.{}, .count = 0 };
 var has_vocabulary: bool = false;
+
+/// The model this instance is running, if any. Its shard bytes are JavaScript's
+/// and stay resident in linear memory; the model only borrows them.
+var model: model_mod.Model = .{};
 
 // ---------------------------------------------------------------------------
 // Version and lifecycle
@@ -62,6 +68,9 @@ export fn qw_destroy(handle: u32) i32 {
     created_handle = 0;
     has_vocabulary = false;
     vocabulary = .{ .offsets = &.{}, .bytes = &.{}, .count = 0 };
+    // Releases a finished model and a partially built one alike: the caller may
+    // destroy at any point in the model state machine.
+    model.reset();
     return abi.Status.ok.code();
 }
 
@@ -281,6 +290,154 @@ export fn qw_selftest(result_ptr: u32) i32 {
     result.reserved = 0;
     result.quant_hash = report.quant_hash;
     result.mel_hash = report.mel_hash;
+    return abi.Status.ok.code();
+}
+
+// ---------------------------------------------------------------------------
+// Model loading
+// ---------------------------------------------------------------------------
+
+/// The capability families this build compiles in, as `abi.Feature` bits.
+///
+/// JavaScript asks this before it downloads a model or calls into a family:
+/// a module built from an older source of the same ABI version reports fewer
+/// bits, and the SDK turns that into a typed `not_implemented` rather than
+/// calling an export that is not there.
+export fn qw_features() u32 {
+    return abi.features;
+}
+
+/// Starts a model attempt, releasing whatever the handle holds.
+///
+/// The arena holds the runtime's allocations for one model: tensor bindings,
+/// layer tables, prompt tokens, and every scratch buffer, including the
+/// key/value cache. The weights are not copied into it -- they stay in the
+/// caller's shard buffers.
+///
+/// This is also the unload path. Calling it again releases a finished model, or
+/// discards a partial one, without destroying the instance: the log-mel
+/// frontend, the tokenizer, and the self-test stay usable either way.
+export fn qw_model_begin(handle: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    model.begin();
+    return abi.Status.ok.code();
+}
+
+/// Parses one `.qw` shard in place and keeps a view over it.
+///
+/// `shard_ptr` must be `shard_len` bytes of a complete shard, starting on a
+/// 16-byte boundary -- what `qw_alloc(size, 16)` returns -- and must stay
+/// resident and unmodified until `qw_destroy`: the weight tensors point into
+/// it. Magic, version, index ordering, tensor shapes, byte lengths, and the
+/// payload checksum are all validated here.
+export fn qw_model_add_shard(handle: u32, shard_ptr: u32, shard_len: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const bytes = regionAt(shard_ptr, shard_len, 16) orelse
+        return abi.Status.invalid_argument.code();
+    const shard: []align(16) const u8 = @alignCast(bytes);
+    model.addShard(shard) catch |err| return abi.statusFromError(err).code();
+    return abi.Status.ok.code();
+}
+
+/// Parses `config.bin`, resolves every tensor, and prepares the decoder.
+///
+/// Returns once the model is usable. A failure releases the arena, so a model
+/// that does not fit leaves no partial allocation behind and the call may be
+/// retried after the caller removes a shard or supplies a smaller budget.
+export fn qw_model_finish(handle: u32, config_ptr: u32, config_len: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    if (model.state != .ready) return abi.Status.invalid_state.code();
+    const config_bytes = regionAt(config_ptr, config_len, 4) orelse
+        return abi.Status.invalid_argument.code();
+    const config = model_config.parse(config_bytes) catch |err| {
+        return abi.statusFromError(err).code();
+    };
+    model.finish(config) catch |err| return abi.statusFromError(err).code();
+    return abi.Status.ok.code();
+}
+
+/// Writes an `abi.ModelRequirements` describing the loaded model.
+///
+/// This is the measurement a caller needs to answer "does this model fit here":
+/// the weight bytes it must keep resident, the key/value cache, the scratch, the
+/// total, and the limits the model decodes within.
+export fn qw_model_requirements(handle: u32, out_ptr: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const out = structRegion(abi.ModelRequirements, out_ptr) orelse
+        return abi.Status.invalid_argument.code();
+    model.requirements(out) catch |err| return abi.statusFromError(err).code();
+    return abi.Status.ok.code();
+}
+
+// ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
+
+/// Encodes one clip, resets the decoder, prefills the prompt, and holds the
+/// first predicted token.
+///
+/// `features_ptr` is the `qw_mel_compute` output for this clip: `mel_bins x
+/// frames` f32 values, row major, `features_len` bytes. The features are read
+/// during this call and never retained. `max_tokens` bounds the generated
+/// sequence for this utterance and may not exceed the configuration's
+/// `max_decode_tokens`; the vocabulary must be installed, because the prompt is
+/// built from it.
+export fn qw_decode_begin(
+    handle: u32,
+    features_ptr: u32,
+    features_len: u32,
+    max_tokens: u32,
+) i32 {
+    if (requireInstance(handle)) |status| return status;
+    // The prompt's ordinary words come from the vocabulary, so decoding without
+    // one is a state error rather than a bad argument.
+    if (!has_vocabulary) return abi.Status.invalid_state.code();
+    if (features_len == 0) return abi.Status.invalid_argument.code();
+    if (features_len % 4 != 0) return abi.Status.invalid_argument.code();
+    const features = f32Region(features_ptr, features_len / 4) orelse
+        return abi.Status.invalid_argument.code();
+    model.decodeBegin(&vocabulary, features, max_tokens) catch |err| {
+        return abi.statusFromError(err).code();
+    };
+    return abi.Status.ok.code();
+}
+
+/// Writes the next produced token id to `token_out_ptr` and returns 1, or
+/// writes nothing and returns 0 when the sequence has finished -- an
+/// end-of-sequence token, or the `max_tokens` budget. Any other return value is
+/// a negative status code.
+export fn qw_decode_step(handle: u32, token_out_ptr: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const token_out = structRegion(u32, token_out_ptr) orelse
+        return abi.Status.invalid_argument.code();
+    const step = model.decodeStep(token_out) catch |err| {
+        return abi.statusFromError(err).code();
+    };
+    return switch (step) {
+        .token => 1,
+        .finished => 0,
+    };
+}
+
+/// Copies the token ids produced so far and returns how many were written, so
+/// the caller can detokenize them with `qw_detokenize`.
+///
+/// `out_capacity_tokens` must hold every id produced: a truncating copy would
+/// silently shorten the transcript, so a buffer that is too small is reported
+/// as `limit_exceeded`.
+export fn qw_decode_tokens(handle: u32, out_ptr: u32, out_capacity_tokens: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const out = u32Region(out_ptr, out_capacity_tokens) orelse
+        return abi.Status.invalid_argument.code();
+    const count = model.decodeTokens(out) catch |err| return abi.statusFromError(err).code();
+    return @intCast(count);
+}
+
+/// Ends the utterance: the key/value cache goes back to empty and the model
+/// stays resident for the next call.
+export fn qw_decode_end(handle: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    model.decodeEnd() catch |err| return abi.statusFromError(err).code();
     return abi.Status.ok.code();
 }
 

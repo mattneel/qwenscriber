@@ -92,7 +92,11 @@ fn mapWithin(area: Area, rest: []const u8) ?Mapping {
             if (findSuffix(&audio_fixed_names, rest)) |kind| return .{ .kind = kind, .layer = 0 };
             const split = splitLayer(rest) orelse return null;
             const kind = findSuffix(&audio_layer_names, split.rest) orelse return null;
-            const layer = std.math.add(u16, container.audio_layer_base, split.index) catch return null;
+            const layer = std.math.add(
+                u16,
+                container.audio_layer_base,
+                split.index,
+            ) catch return null;
             return .{ .kind = kind, .layer = layer };
         },
         .decoder => {
@@ -244,6 +248,7 @@ const fixed_official_names = [_]struct { kind: TensorKind, name: []const u8 }{
 /// `buffer`. Returns `UnknownKind` for a kind the released naming schemes have
 /// no place for.
 pub fn officialName(kind: TensorKind, layer: u16, buffer: []u8) Error![]const u8 {
+    assert(buffer.len > 0);
     if (layer >= container.audio_layer_base) {
         const suffix = suffixOfKind(&audio_layer_names, kind) orelse return Error.UnknownKind;
         const index = layer - container.audio_layer_base;
@@ -334,6 +339,7 @@ pub fn classifyNames(
         const required = layout.at(config, @intCast(position)) orelse unreachable;
         slot.* = .{ .required = required };
     }
+    assert(slots.len == layout.Iterator.count(config));
 
     var unknown: std.ArrayList([]const u8) = .empty;
     var unexpected: std.ArrayList([]const u8) = .empty;
@@ -384,6 +390,7 @@ pub fn positionOf(config: *const model_config.Config, kind: TensorKind, layer: u
     const key = container.sortKey(layer, @backingInt(kind));
     var low: u32 = 0;
     var high: u32 = layout.Iterator.count(config);
+    assert(low <= high);
     while (low < high) {
         const middle = low + (high - low) / 2;
         const required = layout.at(config, middle) orelse unreachable;
@@ -449,7 +456,12 @@ fn readFixture(arena: std.mem.Allocator, path: []const u8) ![]u8 {
     const prefixes = [_][]const u8{ "", "../", "../../", "../../../" };
     for (prefixes) |prefix| {
         const full = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, path });
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, arena, .limited(1 << 20)) catch |err| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            full,
+            arena,
+            .limited(1 << 20),
+        ) catch |err| {
             switch (err) {
                 error.FileNotFound, error.NotDir => continue,
                 else => return err,
@@ -476,11 +488,19 @@ test "the two released naming schemes map onto the same tensors" {
     const names = [_]struct { name: []const u8, kind: TensorKind, layer: u16 }{
         .{ .name = "thinker.audio_tower.conv2d1.weight", .kind = .audio_conv1_weight, .layer = 0 },
         .{ .name = "thinker.audio_tower.conv2d1.bias", .kind = .audio_conv1_bias, .layer = 0 },
-        .{ .name = "thinker.audio_tower.conv_out.weight", .kind = .audio_conv_out_weight, .layer = 0 },
+        .{
+            .name = "thinker.audio_tower.conv_out.weight",
+            .kind = .audio_conv_out_weight,
+            .layer = 0,
+        },
         .{ .name = "thinker.audio_tower.ln_post.bias", .kind = .audio_final_norm_bias, .layer = 0 },
         .{ .name = "thinker.audio_tower.proj1.weight", .kind = .projector_in_weight, .layer = 0 },
         .{ .name = "thinker.audio_tower.proj2.weight", .kind = .projector_out_weight, .layer = 0 },
-        .{ .name = "thinker.model.embed_tokens.weight", .kind = .decoder_embed_tokens_weight, .layer = 0 },
+        .{
+            .name = "thinker.model.embed_tokens.weight",
+            .kind = .decoder_embed_tokens_weight,
+            .layer = 0,
+        },
         .{ .name = "thinker.model.norm.weight", .kind = .decoder_final_norm_weight, .layer = 0 },
         .{ .name = "thinker.lm_head.weight", .kind = .decoder_output_weight, .layer = 0 },
         .{
@@ -525,7 +545,11 @@ test "the two released naming schemes map onto the same tensors" {
         },
         // The transformers-native spellings of the same tensors.
         .{ .name = "model.audio_tower.conv2d1.weight", .kind = .audio_conv1_weight, .layer = 0 },
-        .{ .name = "model.audio_tower.ln_post.weight", .kind = .audio_final_norm_weight, .layer = 0 },
+        .{
+            .name = "model.audio_tower.ln_post.weight",
+            .kind = .audio_final_norm_weight,
+            .layer = 0,
+        },
         .{
             .name = "model.multi_modal_projector.linear_1.weight",
             .kind = .projector_in_weight,
@@ -542,7 +566,11 @@ test "the two released naming schemes map onto the same tensors" {
             .kind = .decoder_embed_tokens_weight,
             .layer = 0,
         },
-        .{ .name = "model.language_model.norm.weight", .kind = .decoder_final_norm_weight, .layer = 0 },
+        .{
+            .name = "model.language_model.norm.weight",
+            .kind = .decoder_final_norm_weight,
+            .layer = 0,
+        },
         .{
             .name = "model.language_model.layers.3.self_attn.v_proj.weight",
             .kind = .decoder_layer_attention_v_weight,
@@ -667,6 +695,113 @@ test "the transformers-native checkpoint lacks only the tied output projection" 
     }
 }
 
+test "classifying a checkpoint file returns every tensor of it in file order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A two-tensor image standing in for a checkpoint, so the file-based entry
+    // point is exercised rather than only the name list.
+    const payload: [4]u8 = @splat(0);
+    const stored = [_]safetensors.StoredTensor{
+        .{
+            .name = "thinker.model.embed_tokens.weight",
+            .dtype_name = "F32",
+            .dims = &.{ 1, 1 },
+            .payload = &payload,
+        },
+        .{
+            .name = "thinker.model.layers.0.mlp.down_proj.weight",
+            .dtype_name = "F32",
+            .dims = &.{ 1, 1 },
+            .payload = &payload,
+        },
+    };
+    const storage = try arena.alloc(u8, @intCast(safetensors.imageLength(&stored, 0)));
+    const used = try safetensors.writeImage(storage, &stored, 0);
+    const file = try safetensors.File.parse(arena, storage[0..used], .{});
+
+    const config = testConfig();
+    const classification = try classifyAll(arena, &config, &file);
+    try std.testing.expectEqual(@as(u32, 2), file.count());
+    // The embedding filled its own slot, and the file's second tensor filled a
+    // decoder layer slot rather than the embedding's.
+    const embedding = classification.slotFor(.decoder_embed_tokens_weight, 0).?;
+    try std.testing.expectEqual(@as(u32, 0), embedding.source_index.?);
+    const down = classification.slotFor(.decoder_layer_ffn_down_weight, 1).?;
+    try std.testing.expectEqual(@as(u32, 1), down.source_index.?);
+    try std.testing.expectEqual(@as(u32, 610), classification.missingCount());
+    try std.testing.expectEqual(@as(usize, 0), classification.unknown.len);
+}
+
+test "a downloaded checkpoint's own configuration accepts its own tensor names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    // Two released spellings of one model, each with the name list taken from
+    // its own safetensors header. The configurations are read from disk, so this
+    // binds the fixture names to the dimensions a checkpoint really declares --
+    // 28 decoder layers and 18 audio layers -- rather than to the test's copy of
+    // them. The checkpoints are downloads, so this test skips what is absent.
+    const cases = [_]struct { dir: []const u8, fixture: []const u8, tied: bool }{
+        .{
+            .dir = "models/Qwen3-ASR-0.6B",
+            .fixture = "tests/fixtures/checkpoint_names_0p6b.txt",
+            .tied = false,
+        },
+        .{
+            .dir = "models/Qwen3-ASR-0.6B-hf",
+            .fixture = "tests/fixtures/checkpoint_names_0p6b_hf.txt",
+            .tied = true,
+        },
+    };
+    const checkpoint_config = @import("checkpoint_config.zig");
+    const tokenizer_file = @import("tokenizer_file.zig");
+
+    for (cases) |case| {
+        var dir = std.Io.Dir.cwd().openDir(io, case.dir, .{}) catch continue;
+        defer dir.close(io);
+        const config_bytes = dir.readFileAlloc(
+            io,
+            "config.json",
+            arena,
+            .limited(1 << 20),
+        ) catch continue;
+
+        var token_diagnostics: tokenizer_file.Diagnostics = .{};
+        const tokens = try tokenizer_file.read(arena, io, dir, &token_diagnostics);
+        var config_diagnostics: checkpoint_config.Diagnostics = .{};
+        const parsed = try checkpoint_config.parse(arena, .{
+            .config_json = config_bytes,
+            .tokenizer_config_json = dir.readFileAlloc(
+                io,
+                "tokenizer_config.json",
+                arena,
+                .limited(1 << 20),
+            ) catch null,
+            .generation_json = dir.readFileAlloc(
+                io,
+                "generation_config.json",
+                arena,
+                .limited(1 << 20),
+            ) catch null,
+            .specials = tokens.specials,
+        }, &config_diagnostics);
+
+        const names = try fixtureLines(arena, case.fixture);
+        const classification = try classifyNames(arena, &parsed.config, names);
+        try std.testing.expectEqual(@as(usize, 0), classification.unknown.len);
+        try std.testing.expectEqual(@as(usize, 0), classification.unexpected.len);
+        try std.testing.expectEqual(@as(usize, 0), classification.duplicate.len);
+        try std.testing.expectEqual(@as(u32, 612), layout.Iterator.count(&parsed.config));
+        const missing: u32 = if (case.tied) 1 else 0;
+        try std.testing.expectEqual(missing, classification.missingCount());
+        try std.testing.expectEqual(missing == 0, classification.isComplete());
+    }
+}
+
 test "duplicate and unrecognized names are reported rather than dropped" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -684,7 +819,10 @@ test "duplicate and unrecognized names are reported rather than dropped" {
     const classification = try classifyNames(arena, &config, &names);
 
     try std.testing.expectEqual(@as(usize, 1), classification.duplicate.len);
-    try std.testing.expectEqualStrings("thinker.audio_tower.conv2d1.weight", classification.duplicate[0]);
+    try std.testing.expectEqualStrings(
+        "thinker.audio_tower.conv2d1.weight",
+        classification.duplicate[0],
+    );
     try std.testing.expectEqual(@as(usize, 1), classification.unknown.len);
     try std.testing.expectEqualStrings("thinker.mystery.weight", classification.unknown[0]);
     // A name the mapping recognizes for a layer this configuration does not
@@ -704,7 +842,10 @@ test "duplicate and unrecognized names are reported rather than dropped" {
     var buffer: [128]u8 = undefined;
     const bogus: TensorKind = @fromBackingInt(@intCast(60_000));
     try std.testing.expectError(Error.UnknownKind, officialName(bogus, 0, &buffer));
-    try std.testing.expectError(Error.UnknownKind, officialName(.decoder_output_weight, 3, &buffer));
+    try std.testing.expectError(
+        Error.UnknownKind,
+        officialName(.decoder_output_weight, 3, &buffer),
+    );
     var small: [8]u8 = undefined;
     try std.testing.expectError(
         Error.NameBufferTooSmall,

@@ -359,6 +359,11 @@ fn renderMerges(arena: std.mem.Allocator, merges: []const std.json.Value) ![]con
     var text: std.Io.Writer.Allocating = .init(arena);
     defer text.deinit();
     const out = &text.writer;
+    // The version line a `merges.txt` carries. Writing it makes a table rendered
+    // from `tokenizer.json` byte-identical to the one the other export ships for
+    // the same merges, so the two spellings of a checkpoint convert to the same
+    // directory.
+    try out.writeAll("#version: 0.2\n");
     for (merges) |merge| {
         switch (merge) {
             // The current format is a pair of token strings.
@@ -617,8 +622,9 @@ test "a tokenizer.json checkpoint yields the same table and a rendered merge lis
     try std.testing.expectEqual(@as(u32, 5), data.count);
     try std.testing.expectEqualStrings("abc<|im_end|><asr_text>", data.bytes);
     try std.testing.expectEqual(@as(u32, 3), data.idOf("<|im_end|>").?);
-    // The merge list renders as the same text `merges.txt` would carry.
-    try std.testing.expectEqualStrings("a b\nb c\n", data.merges.?);
+    // The merge list renders as the same text `merges.txt` would carry,
+    // version line included.
+    try std.testing.expectEqualStrings("#version: 0.2\na b\nb c\n", data.merges.?);
     try data.table().validate();
     try std.testing.expectEqual(@as(usize, 0), diagnostics.gap_count);
 }

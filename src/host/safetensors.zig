@@ -186,6 +186,7 @@ pub const Tensor = struct {
         const count = try self.elementCount();
         if (element_offset > count) return Error.DecodeOutOfRange;
         if (out.len > count - element_offset) return Error.DecodeOutOfRange;
+        assert(element_offset + out.len <= count);
 
         switch (self.dtype) {
             .f32 => widenF32(self.data, element_offset, out),
@@ -214,8 +215,14 @@ pub const File = struct {
         if (header_length > bytes.len - header_length_bytes) return Error.Truncated;
         const header_bytes = bytes[header_length_bytes..][0..@intCast(header_length)];
         const data = bytes[header_length_bytes + @as(usize, @intCast(header_length)) ..];
+        assert(header_bytes.len == header_length);
 
-        const root = std.json.parseFromSliceLeaky(std.json.Value, arena, header_bytes, .{}) catch |err| {
+        const root = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
+            header_bytes,
+            .{},
+        ) catch |err| {
             return switch (err) {
                 error.OutOfMemory => Error.OutOfMemory,
                 // The default duplicate-field behavior is `error`, which is
@@ -253,7 +260,9 @@ pub const File = struct {
         }
         assert(position == tensor_count);
 
+        assert(position == tensor_count);
         try validateRanges(arena, tensors);
+        assert(tensors.len <= object.count());
         return .{ .bytes = bytes, .tensors = tensors };
     }
 
@@ -331,6 +340,7 @@ pub const Checkpoint = struct {
         }
         if (file_names.items.len == 0) return Error.NoSafetensorsFile;
         if (file_names.items.len > checkpoint_files_max) return Error.TooManySafetensorsFiles;
+        assert(file_names.items.len <= checkpoint_files_max);
         // A directory's entry order is the filesystem's, not the format's, so
         // the files are sorted: two conversions of one checkpoint must produce
         // the same report and the same shards.
@@ -479,6 +489,7 @@ fn tensorFromValue(
         shape.rank += 1;
     }
     if (shape.rank == 0) return Error.InvalidShape;
+    assert(shape.rank <= tensor.rank_max);
 
     const payload = data[@intCast(start)..@intCast(end)];
     var entry = Tensor{
@@ -530,6 +541,7 @@ fn canReinterpret(data: []const u8, comptime Element: type) bool {
 
 fn widenF32(data: []const u8, element_offset: u64, out: []f32) void {
     const bytes = data[@intCast(element_offset * 4)..][0 .. out.len * 4];
+    assert(bytes.len == out.len * 4);
     if (canReinterpret(bytes, f32)) {
         const source: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, bytes));
         @memcpy(out, source);
@@ -543,6 +555,7 @@ fn widenF32(data: []const u8, element_offset: u64, out: []f32) void {
 
 fn widenF16(data: []const u8, element_offset: u64, out: []f32) void {
     const bytes = data[@intCast(element_offset * 2)..][0 .. out.len * 2];
+    assert(bytes.len == out.len * 2);
     if (canReinterpret(bytes, u16)) {
         const source: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, bytes));
         for (source, out) |bits, *value| value.* = half_float.fromF16(bits);
@@ -556,6 +569,7 @@ fn widenF16(data: []const u8, element_offset: u64, out: []f32) void {
 
 fn widenBf16(data: []const u8, element_offset: u64, out: []f32) void {
     const bytes = data[@intCast(element_offset * 2)..][0 .. out.len * 2];
+    assert(bytes.len == out.len * 2);
     if (canReinterpret(bytes, u16)) {
         const source: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, bytes));
         for (source, out) |bits, *value| value.* = half_float.fromBf16(bits);
@@ -650,6 +664,7 @@ fn buildImage(
     header_pad: usize,
 ) ![]u8 {
     const storage = try allocator.alloc(u8, @intCast(imageLength(tensors, header_pad)));
+    assert(storage.len >= header_length_bytes);
     const used = try writeImage(storage, tensors, header_pad);
     return storage[0..used];
 }
@@ -722,7 +737,8 @@ test "a well-formed image exposes every tensor with its dtype, shape and bytes" 
     try std.testing.expectEqual(@as(usize, 16), f32_tensor.bytesOf().len);
     // The reader must not copy: the payload is inside the caller's buffer.
     try std.testing.expect(@intFromPtr(f32_tensor.bytesOf().ptr) >= @intFromPtr(image.ptr));
-    try std.testing.expect(@intFromPtr(f32_tensor.bytesOf().ptr) < @intFromPtr(image.ptr) + image.len);
+    const image_end = @intFromPtr(image.ptr) + image.len;
+    try std.testing.expect(@intFromPtr(f32_tensor.bytesOf().ptr) < image_end);
 
     var decoded: [4]f32 = undefined;
     try f32_tensor.decodeF32(&decoded);
@@ -830,7 +846,8 @@ test "malformed and unfamiliar headers are rejected rather than guessed" {
             .expected = Error.InvalidDTypeField,
         },
         .{
-            .header = "{\"a\": {\"dtype\": \"F32\", \"shape\": \"nope\", \"data_offsets\": [0, 4]}}",
+            .header = "{\"a\": {\"dtype\": \"F32\", \"shape\": \"nope\"," ++
+                " \"data_offsets\": [0, 4]}}",
             .expected = Error.MalformedHeader,
         },
         .{
@@ -842,11 +859,13 @@ test "malformed and unfamiliar headers are rejected rather than guessed" {
             .expected = Error.MalformedHeader,
         },
         .{
-            .header = "{\"a\": {\"dtype\": \"F32\", \"shape\": [1], \"data_offsets\": [0, 4], \"extra\": 1}}",
+            .header = "{\"a\": {\"dtype\": \"F32\", \"shape\": [1], \"data_offsets\": [0, 4]," ++
+                " \"extra\": 1}}",
             .expected = Error.MalformedHeader,
         },
         .{
-            .header = "{\"a\": {\"dtype\": \"F32\", \"shape\": [1, 2, 3, 4, 5], \"data_offsets\": [0, 4]}}",
+            .header = "{\"a\": {\"dtype\": \"F32\", \"shape\": [1, 2, 3, 4, 5]," ++
+                " \"data_offsets\": [0, 4]}}",
             .expected = Error.InvalidShape,
         },
         .{
@@ -921,9 +940,9 @@ test "byte ranges must match the shape, stay inside the payload and not overlap"
     // Unaligned, gap-carrying ranges are legal: offsets need only lie inside
     // the data section and stay disjoint, because a checkpoint's own alignment
     // is a property of the tool that wrote it, not of this format.
-    const sparse_header = "{\"a\": {\"dtype\": \"F16\", \"shape\": [3], \"data_offsets\": [0, 6]}," ++
-        "\"b\": {\"dtype\": \"F16\", \"shape\": [3], \"data_offsets\": [8, 14]}}";
-    const sparse_image = try buildRawImage(arena, sparse_header, &payload);
+    const first = "{\"a\": {\"dtype\": \"F16\", \"shape\": [3], \"data_offsets\": [0, 6]},";
+    const second = "\"b\": {\"dtype\": \"F16\", \"shape\": [3], \"data_offsets\": [8, 14]}}";
+    const sparse_image = try buildRawImage(arena, first ++ second, &payload);
     const sparse_file = try File.parse(arena, sparse_image, .{});
     try std.testing.expectEqual(@as(u32, 2), sparse_file.count());
     try std.testing.expectEqual(@as(u64, 0), sparse_file.find("a").?.offset_bytes);
