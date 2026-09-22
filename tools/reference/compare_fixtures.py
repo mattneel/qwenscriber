@@ -120,6 +120,23 @@ def main() -> int:
 
         ours = load(ours_path)
         reference = load(reference_path)
+        # `generated_ids` is the one stage where the two sides record different
+        # things: the reference writes everything `generate` returned, prompt
+        # included, while the runner writes only what it generated and stops at
+        # the end token. Compare our tokens against the reference's own generated
+        # tail, at our length, which is the comparison that means something.
+        if name == "generated_ids":
+            prompt_file = args.reference / "decoder_input_ids.f32"
+            prompt_length = int(load(prompt_file).size) if prompt_file.exists() else 0
+            generation = reference[prompt_length:]
+            print(
+                f"{'':22} note: reference generated {generation.size} tokens; ours "
+                f"generated {ours.size} and stops at the end token"
+            )
+            if ours.size <= generation.size:
+                reference = generation[: ours.size]
+            else:
+                reference = generation
         if ours.shape != reference.shape:
             print(f"{name:22} SHAPE MISMATCH ours={ours.shape} reference={reference.shape}")
             failures += 1
