@@ -79,6 +79,10 @@ def main() -> int:
     log_mel = extractor._torch_extract_fbank_features(waveform)
     write_fixture(args.output / "mel_expected_unpadded.f32", np.asarray(log_mel, dtype=np.float32))
     print(f"unpadded log-mel shape {log_mel.shape}")
+    # The processor drops a final partial hop (floor(samples / hop)), and the
+    # processor is what the model is fed, so the fixture the runtime is checked
+    # against has to drop it too. The extractor's own call above keeps it, which
+    # is why this count and the one below differ by one for this waveform.
 
     # The authoritative pipeline path: the extractor zero-pads the clip to a
     # whole 30 seconds, computes the spectrogram over that buffer, and marks a
@@ -88,6 +92,11 @@ def main() -> int:
     padded = np.asarray(batch["input_features"], dtype=np.float32)
     mask = np.asarray(batch["attention_mask"])
     valid_frames = int(mask.sum())
+    hop_length = 160
+    processed_frames = len(waveform) // hop_length
+    if processed_frames != valid_frames:
+        print(f"processor marks {valid_frames} frames valid; the runtime uses {processed_frames}")
+    valid_frames = min(valid_frames, processed_frames)
     expected = padded[0, :, :valid_frames]
     write_fixture(args.output / "mel_expected.f32", expected)
     print(

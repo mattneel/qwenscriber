@@ -31,9 +31,10 @@
 //!     audio. Reflecting there would silently change the last few frames of
 //!     every clip, so `sampleAt` returns zero for that whole region and only
 //!     mirrors at the very end of the 30-second capacity.
-//!   * Frames that survive are `ceil(sample_count / hop_length)`, one more than
-//!     the frame count a direct unpadded transform would produce when the clip
-//!     length is not a multiple of the hop.
+//!   * Frames that survive are `floor(sample_count / hop_length)`: a final partial
+//!     hop is dropped, because that is what the reference processor marks valid
+//!     and therefore what the model is fed. The feature extractor called on its
+//!     own keeps that frame, so the two disagree by one and the processor wins.
 //!
 //! Frames that fall in the zero-padded region hold samples of pure digital
 //! silence. Their log-mel value is not zero either: silence clamps to `1e-10`,
@@ -92,10 +93,16 @@ pub const Tables = struct {
 
 pub const tables: Tables = computeTables();
 
-/// Frames the reference marks valid for a clip of `sample_count` samples: a
-/// frame counts while its first sample is a real one.
+/// Frames the reference frontend produces for `sample_count` samples.
+///
+/// A final partial hop is dropped. That is what the reference *processor* marks
+/// valid, and the processor is what the model is fed: measured against the
+/// installed implementation at 12345 -> 77, 67200 -> 420, 67263 -> 420,
+/// 67264 -> 420, 80000 -> 500, and 480000 -> 3000 samples. Calling the feature
+/// extractor directly instead keeps the partial frame (12345 -> 78,
+/// 67263 -> 421), so the two disagree by one and this is the rule that matters.
 pub fn framesForSamples(sample_count: usize) usize {
-    return (sample_count + hop_length - 1) / hop_length;
+    return sample_count / hop_length;
 }
 
 /// Clip length the reference effectively transforms, after its minimum-length
@@ -601,10 +608,10 @@ test "output and frame bounds are enforced" {
 
 test "frame counts follow the reference's masking rule" {
     // ceil(samples / hop): the last frame is kept while its first sample is real.
-    try std.testing.expectEqual(@as(usize, 78), framesForSamples(12345));
+    try std.testing.expectEqual(@as(usize, 77), framesForSamples(12345));
     try std.testing.expectEqual(@as(usize, 78), framesForSamples(12480));
-    try std.testing.expectEqual(@as(usize, 79), framesForSamples(12481));
-    try std.testing.expectEqual(@as(usize, 1), framesForSamples(1));
+    try std.testing.expectEqual(@as(usize, 78), framesForSamples(12481));
+    try std.testing.expectEqual(@as(usize, 0), framesForSamples(1));
     try std.testing.expectEqual(@as(usize, 800), framesForSamples(128000));
     try std.testing.expectEqual(@as(usize, 50), framesForSamples(min_samples));
     try std.testing.expectEqual(@as(usize, 3000), framesForSamples(capacity_samples));

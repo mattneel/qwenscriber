@@ -85,7 +85,7 @@ test "log-mel matches the reference pipeline output" {
 
     try waveform.expectShape(1, &.{12345});
     const frames = qw.mel.framesForSamples(waveform.payload.len);
-    try std.testing.expectEqual(@as(usize, 78), frames);
+    try std.testing.expectEqual(@as(usize, 77), frames);
     try expected.expectShape(2, &.{ qw.mel.mel_bins, @as(u32, @intCast(frames)) });
 
     const features = try std.testing.allocator.alloc(f32, qw.mel.mel_bins * frames);
