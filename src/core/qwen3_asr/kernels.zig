@@ -363,8 +363,10 @@ pub fn conv2d1x3x3Stride2Gelu(
                         const in_column = @as(isize, @intCast(out_column * 2)) +
                             @as(isize, @intCast(kernel_column)) - 1;
                         if (in_column < 0 or in_column >= geometry.in_width) continue;
-                        const sample = input[@as(usize, @intCast(in_row)) * geometry.in_width +
-                            @as(usize, @intCast(in_column))];
+                        const sample = input[
+                            @as(usize, @intCast(in_row)) * geometry.in_width +
+                                @as(usize, @intCast(in_column))
+                        ];
                         accumulator += kernel_weights[kernel_row * geometry.kernel + kernel_column] *
                             sample;
                     }
@@ -639,10 +641,8 @@ test "quantized linear matches a dequantized dense linear" {
         quant.quantizeRow(
             .q4,
             row_values,
-            scales[row * groups_per_row * quant.q4_scale_bytes_per_group ..][0 ..
-                groups_per_row * quant.q4_scale_bytes_per_group],
-            data[row * groups_per_row * quant.dataBytesPerGroup(.q4) ..][0 ..
-                groups_per_row * quant.dataBytesPerGroup(.q4)],
+            scales[row * groups_per_row * quant.q4_scale_bytes_per_group ..][0 .. groups_per_row * quant.q4_scale_bytes_per_group],
+            data[row * groups_per_row * quant.dataBytesPerGroup(.q4) ..][0 .. groups_per_row * quant.dataBytesPerGroup(.q4)],
         );
     }
 

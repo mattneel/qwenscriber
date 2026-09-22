@@ -67,7 +67,7 @@ pub const Required = struct {
     }
 
     pub fn key(self: Required) u32 {
-        return container.sortKey(self.layer, @intFromEnum(self.kind));
+        return container.sortKey(self.layer, @backingInt(self.kind));
     }
 };
 
@@ -441,7 +441,7 @@ fn testConfig() model_config.Config {
     return .{
         .magic = model_config.magic_bytes,
         .format_version = model_config.format_version,
-        .architecture = @intFromEnum(model_config.Architecture.qwen3_asr),
+        .architecture = @backingInt(model_config.Architecture.qwen3_asr),
         .audio_d_model = 896,
         .audio_layers = 18,
         .audio_attention_heads = 14,

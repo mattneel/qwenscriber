@@ -32,6 +32,7 @@
 - [Runtime configuration](reference/configuration.md)
 - [C ABI](reference/c-abi.md)
 - [Model manifest](reference/model-manifest.md)
+- [Model format](reference/model-format.md)
 - [Errors and traps](reference/errors.md)
 
 # Development

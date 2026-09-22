@@ -1,0 +1,101 @@
+name: ci
+
+# CI is the authority for every distributable artifact (ADR-0004). It runs the
+# same gates a developer runs locally, so a green build here means the commands
+# in docs/src/getting-started and docs/src/development passed on a clean
+# checkout rather than on one machine's warm cache.
+#
+# The GPU conformance harness is deliberately absent: it needs a real WebGPU
+# adapter, and a runner without one would either skip silently or fail for
+# reasons unrelated to the change. Run it with `node tests/gpu/driver.mjs` on a
+# machine that has one.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zig:
+    name: Zig core, WASM module, and ABI self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Nothing in the build reads git metadata, but a shallow checkout
+          # keeps the job fast and the artifact deterministic.
+          fetch-depth: 1
+      - uses: mlugg/setup-zig@v2
+        with:
+          # The repository tracks Zig master and pins the revision it was
+          # written against in build.zig.zon.
+          version: master
+      - name: Report toolchain
+        run: zig version
+      - name: Format check, unit tests, reference comparisons, WASM ABI
+        run: zig build check
+      - name: Build the freestanding module
+        run: zig build wasm
+
+  shaders:
+    name: Shader and quantization layout drift gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Fail if the WGSL mirrors stop matching src/core
+        run: node tests/gpu/layout_drift.mjs
+
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: Build the WASM module the package embeds
+        run: zig build wasm
+      - name: Build, typecheck, and test
+        working-directory: packages/qwenscriber
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm run typecheck
+          npm test
+
+  book:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+      - name: Build the mdBook
+        run: mdbook build docs
+      - name: Upload the rendered book
+        uses: actions/upload-artifact@v4
+        with:
+          name: book
+          path: docs/book
+          if-no-files-found: error

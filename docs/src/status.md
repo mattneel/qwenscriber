@@ -53,7 +53,9 @@ GPU adapter; it is not part of the default command set.
 ## Not yet true
 
 - No release, package, or artifact has been published.
-- No CI workflow exists yet, so ADR-0004 has no enforcement behind it.
+- `.github/workflows/ci.yml` exists but has not run on GitHub yet, so ADR-0004 has no enforcement
+  behind it at the time of writing. The gates it runs are the same commands listed above, plus
+  `zig build check`.
 - No performance number on this page has been measured under the benchmark hooks described in the
   architecture pages.
 

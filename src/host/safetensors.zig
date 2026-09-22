@@ -315,6 +315,9 @@ pub const Checkpoint = struct {
     /// name classification refers to.
     tensors: []const *const Tensor,
 
+    /// `dir` must have been opened with iteration capability
+    /// (`OpenOptions.iterate = true`), because which files exist is the
+    /// directory's answer, not the caller's.
     pub fn open(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Checkpoint {
         var file_names: std.ArrayList([]const u8) = .empty;
         var iterator = dir.iterate();
@@ -704,7 +707,7 @@ test "a well-formed image exposes every tensor with its dtype, shape and bytes" 
     const entries = [_]StoredTensor{
         .{ .name = "w.f32", .dtype_name = "F32", .dims = &.{ 2, 2 }, .payload = f32_bytes },
         .{ .name = "w.f16", .dtype_name = "F16", .dims = &.{ 2, 3 }, .payload = f16_bytes },
-        .{ .name = "w.bf16", .dtype_name = "BF16", .dims = &.{ 4 }, .payload = bf16_bytes },
+        .{ .name = "w.bf16", .dtype_name = "BF16", .dims = &.{4}, .payload = bf16_bytes },
     };
     const image = try buildImage(arena, &entries, 0);
 

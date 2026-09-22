@@ -518,8 +518,10 @@ pub const Model = struct {
             var frequency: u32 = 0;
             while (frequency < frequency_bins) : (frequency += 1) {
                 flat[channel * frequency_bins + frequency] =
-                    self.scratch.conv3[(@as(usize, channel) * frequency_bins + frequency) *
-                        self.config.audioChunkSteps() + step];
+                    self.scratch.conv3[
+                        (@as(usize, channel) * frequency_bins + frequency) *
+                            self.config.audioChunkSteps() + step
+                    ];
             }
         }
         try self.conv_out_weight.apply(out, flat, conv_out_features, 1, self.scratch.row);
@@ -760,12 +762,12 @@ const d_model_max = 4096;
 fn resolve(required: layout.Required, shards: []const *const container.File) Error!Binding {
     var found: ?Binding = null;
     for (shards) |shard| {
-        const entry = shard.find(@intFromEnum(required.kind), required.layer) orelse continue;
+        const entry = shard.find(@backingInt(required.kind), required.layer) orelse continue;
         if (found != null) return Error.DuplicateTensor;
         const format = entry.storageFormat() catch return Error.UnsupportedFormat;
         const shape = entry.shape() catch return Error.UnexpectedShape;
         if (!shape.eql(&required.shape)) return Error.UnexpectedShape;
-        const bytes = shard.tensorBytes(@intFromEnum(required.kind), required.layer) orelse
+        const bytes = shard.tensorBytes(@backingInt(required.kind), required.layer) orelse
             return Error.MissingTensor;
         found = .{
             .kind = required.kind,
@@ -984,7 +986,7 @@ fn testConfig() model_config.Config {
     return .{
         .magic = model_config.magic_bytes,
         .format_version = model_config.format_version,
-        .architecture = @intFromEnum(model_config.Architecture.qwen3_asr),
+        .architecture = @backingInt(model_config.Architecture.qwen3_asr),
         .audio_d_model = 896,
         .audio_layers = 2,
         .audio_attention_heads = 14,

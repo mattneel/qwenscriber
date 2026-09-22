@@ -181,7 +181,7 @@ pub fn parse(
     var config = std.mem.zeroes(model_config.Config);
     config.magic = model_config.magic_bytes;
     config.format_version = model_config.format_version;
-    config.architecture = @intFromEnum(model_config.Architecture.qwen3_asr);
+    config.architecture = @backingInt(model_config.Architecture.qwen3_asr);
     // Not in any configuration file; see the module comment.
     config.audio_layer_norm_eps = audio_layer_norm_eps_default;
     try readAudioFields(&reader, audio, &config);
@@ -1068,7 +1068,7 @@ test "special token ids are resolved from the files that carry them" {
     }, &diagnostics));
 
     // An empty end-of-sequence list is a configuration error, not an empty set.
-    const empty_eos = 
+    const empty_eos =
         \\{"model_type":"qwen3_asr","dtype":"bfloat16","audio_token_id":151676,
         \\ "eos_token_id":[],
         \\ "audio_config":{"d_model":896,"encoder_layers":18,"encoder_attention_heads":14,

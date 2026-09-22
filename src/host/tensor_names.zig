@@ -51,7 +51,7 @@ pub const Mapping = struct {
     layer: u16,
 
     pub fn key(self: Mapping) u32 {
-        return container.sortKey(self.layer, @intFromEnum(self.kind));
+        return container.sortKey(self.layer, @backingInt(self.kind));
     }
 };
 
@@ -381,7 +381,7 @@ pub fn classifyAll(
 /// `(layer, kind)` order, so this is a binary search over positions rather than
 /// a linear scan through 612 descriptions.
 pub fn positionOf(config: *const model_config.Config, kind: TensorKind, layer: u16) ?u32 {
-    const key = container.sortKey(layer, @intFromEnum(kind));
+    const key = container.sortKey(layer, @backingInt(kind));
     var low: u32 = 0;
     var high: u32 = layout.Iterator.count(config);
     while (low < high) {
@@ -405,7 +405,7 @@ fn testConfig() model_config.Config {
     return .{
         .magic = model_config.magic_bytes,
         .format_version = model_config.format_version,
-        .architecture = @intFromEnum(model_config.Architecture.qwen3_asr),
+        .architecture = @backingInt(model_config.Architecture.qwen3_asr),
         .audio_d_model = 896,
         .audio_layers = 18,
         .audio_attention_heads = 14,

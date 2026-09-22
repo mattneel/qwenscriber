@@ -275,7 +275,7 @@ fn testConfig() model_config.Config {
     return .{
         .magic = model_config.magic_bytes,
         .format_version = model_config.format_version,
-        .architecture = @intFromEnum(model_config.Architecture.qwen3_asr),
+        .architecture = @backingInt(model_config.Architecture.qwen3_asr),
         .audio_d_model = 64,
         .audio_layers = 1,
         .audio_attention_heads = 2,

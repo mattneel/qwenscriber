@@ -392,7 +392,7 @@ const Driver = struct {
         const payload = self.payload.items[start..][0..@intCast(len_bytes)];
         try fillPayload(entry_source, required, format, payload, self.scratch, self.diagnostics);
         try self.entries.append(self.arena, .{
-            .kind = @intFromEnum(required.kind),
+            .kind = @backingInt(required.kind),
             .layer = required.layer,
             .format = @backingInt(format),
             .rank = required.shape.rank,
@@ -977,7 +977,7 @@ fn tinyConfig() model_config.Config {
     return .{
         .magic = model_config.magic_bytes,
         .format_version = model_config.format_version,
-        .architecture = @intFromEnum(model_config.Architecture.qwen3_asr),
+        .architecture = @backingInt(model_config.Architecture.qwen3_asr),
         .audio_d_model = tiny_audio_d_model,
         .audio_layers = 1,
         .audio_attention_heads = tiny_audio_heads,
@@ -1126,6 +1126,10 @@ fn writeTinyImage(
     var iterator = layout.Iterator.init(&config);
     var seed: f32 = 0;
     while (iterator.next()) |required| {
+        // The output projection is the checkpoint's choice, not the
+        // inventory's: `appendOutputTensor` adds it when the checkpoint ships
+        // one, because a tied checkpoint has none.
+        if (required.kind == .decoder_output_weight) continue;
         const omit = options.omit != null and options.omit.? == required.kind;
         const break_shape = options.break_shape_of != null and
             options.break_shape_of.? == required.kind;
@@ -1272,6 +1276,7 @@ fn expectModelDirectory(
     const positions = layout.Iterator.count(config);
     const seen = try arena.alloc(bool, positions);
     @memset(seen, false);
+    _ = &seen;
     var covered: u32 = 0;
     for (report.shards, 0..) |shard, index| {
         covered += try expectShard(
@@ -1281,7 +1286,7 @@ fn expectModelDirectory(
             config,
             report.quantization,
             shard,
-            &seen,
+            seen,
         );
         const range = expected.layer_ranges[index];
         try std.testing.expectEqual(range[0], shard.first_layer);
@@ -1395,18 +1400,18 @@ fn expectTokenFile(
     while (id < token_count) : (id += 1) {
         try std.testing.expect(tokenOffset(bytes, id) <= tokenOffset(bytes, id + 1));
     }
-    try std.testing.expectEqual(@as(u32, text.len), tokenOffset(bytes, token_count));
+    try std.testing.expectEqual(@as(usize, text.len), @as(usize, tokenOffset(bytes, token_count)));
     try std.testing.expectEqualStrings(
         "t0",
         text[tokenOffset(bytes, 0)..tokenOffset(bytes, 1)],
     );
     try std.testing.expectEqualStrings(
         "<|audio_start|>",
-        text[tokenOffset(bytes, tiny_token_audio_start) ..][0..15],
+        text[tokenOffset(bytes, tiny_token_audio_start)..][0..15],
     );
     try std.testing.expectEqualStrings(
         "<asr_text>",
-        text[tokenOffset(bytes, tiny_token_asr_text) ..][0..10],
+        text[tokenOffset(bytes, tiny_token_asr_text)..][0..10],
     );
 }
 
@@ -1450,7 +1455,9 @@ test "a synthetic checkpoint converts into a model directory the runtime can loa
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1519,7 +1526,7 @@ fn expectF32TensorRoundTrips(
             null,
         );
         const file = try container.File.parse(bytes);
-        const stored = file.f32Values(@intFromEnum(required.kind), required.layer) orelse continue;
+        const stored = file.f32Values(@backingInt(required.kind), required.layer) orelse continue;
         try std.testing.expectEqualSlices(f32, &expected, stored);
         return;
     }
@@ -1534,7 +1541,9 @@ test "an output projection identical to the embedding is stored once" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1562,7 +1571,9 @@ test "an output projection that differs from the embedding is stored and untied"
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1591,7 +1602,9 @@ test "a checkpoint missing a tensor the runtime needs is rejected by name" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1620,7 +1633,9 @@ test "a checkpoint whose weights claim to be untied must ship an output projecti
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1642,7 +1657,9 @@ test "a tensor stored at a shape the inventory did not declare is rejected" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1668,7 +1685,9 @@ test "a checkpoint with more layers than its configuration describes is rejected
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
     defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
@@ -1686,7 +1705,7 @@ test "a checkpoint with more layers than its configuration describes is rejected
     );
 }
 
-test "a checkpoint with no tensors at all is rejected rather than half converted" {
+test "a directory that is not a checkpoint is rejected before anything is written" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1694,27 +1713,41 @@ test "a checkpoint with no tensors at all is rejected rather than half converted
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{});
-    defer input.close(io);
     var output = try tmp.dir.createDirPathOpen(io, "model", .{});
     defer output.close(io);
-
-    try writeTinyCheckpoint(arena, io, input, .{});
-    // A directory whose image is missing is not a checkpoint, whatever else it
-    // holds.
-    try input.deleteFile(io, "model.safetensors");
-
     var diagnostics: Diagnostics = .{};
-    try std.testing.expectError(
-        safetensors.Error.NoSafetensorsFile,
-        convertTiny(arena, io, input, output, 8192, false, &diagnostics),
-    );
 
-    // And a directory with no configuration at all is no better.
-    var empty = try tmp.dir.createDirPathOpen(io, "empty", .{});
+    // Nothing at all: the tokenizer is read first, and its absence is the first
+    // thing that stops a conversion.
+    var empty = try tmp.dir.createDirPathOpen(io, "empty", .{
+        .open_options = .{ .iterate = true },
+    });
     defer empty.close(io);
     try std.testing.expectError(
-        Error.MissingConfigFile,
+        tokenizer_file.Error.MissingTokenizerFiles,
         convertTiny(arena, io, empty, output, 8192, false, &diagnostics),
+    );
+
+    // A tokenizer but no configuration.
+    var no_config = try tmp.dir.createDirPathOpen(io, "no-config", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer no_config.close(io);
+    try writeTinyVocab(arena, io, no_config);
+    try std.testing.expectError(
+        Error.MissingConfigFile,
+        convertTiny(arena, io, no_config, output, 8192, false, &diagnostics),
+    );
+
+    // A configuration but no weights.
+    var no_weights = try tmp.dir.createDirPathOpen(io, "no-weights", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer no_weights.close(io);
+    try writeTinyCheckpoint(arena, io, no_weights, .{});
+    try no_weights.deleteFile(io, "model.safetensors");
+    try std.testing.expectError(
+        safetensors.Error.NoSafetensorsFile,
+        convertTiny(arena, io, no_weights, output, 8192, false, &diagnostics),
     );
 }

@@ -20,7 +20,7 @@ pub const convert = @import("convert.zig");
 
 /// Version of the conversion tooling, recorded in every manifest. Bumped when a
 /// change alters the bytes a model directory contains.
-pub const tool_version = "qwenscriber-convert 1";
+pub const tool_version = convert.tool_version;
 
 test {
     std.testing.refAllDecls(@This());
