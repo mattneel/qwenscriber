@@ -1,0 +1,68 @@
+<!doctype html>
+<!--
+  Qwenscriber WebGPU harness page.
+
+  Serves the same job as `node tests/gpu/harness.mjs`, one layer down: it runs the
+  kernel comparison suite in the browser, renders the table, and publishes
+  `window.__result` for whichever driver is watching.
+
+  Run it any of these ways:
+
+      node tests/gpu/harness.mjs              # this repository's own driver: it
+                                              # serves the repo, launches headless
+                                              # Chrome with SwiftShader, prints the
+                                              # table, exits nonzero on failure
+
+      python3 -m http.server 8766 --bind 127.0.0.1
+      # then, from Windows (a WSL2 host's GPU belongs to Windows):
+      cmd.exe /c 'cd /d C:\Users\<you>\omp-browser && node.exe run-page.mjs \
+          http://127.0.0.1:8766/tests/gpu/harness.html --settle-ms 60000'
+
+  The page must be served over http: `file://` is not a secure context, so
+  `navigator.gpu` is undefined there. Load it from the repository root, because
+  it fetches `gpu/shaders/*.wgsl` and `zig-out/bin/qwenscriber_core.wasm`
+  relative to its own module URL.
+
+  It is self contained and deterministic: fixed seeds, fixed shapes, no network
+  beyond the repository's own files. Re-running it is a regression gate.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>qwenscriber gpu harness</title>
+    <style>
+      body {
+        background: #101418;
+        color: #d8dee9;
+        font: 13px/1.5 ui-monospace, monospace;
+        margin: 2rem;
+      }
+      pre { white-space: pre; overflow-x: auto; }
+      #status { color: #8fbcbb; margin-bottom: 1rem; }
+    </style>
+  </head>
+  <body>
+    <div id="status">running... the table appears here when the suite finishes</div>
+    <pre id="table"></pre>
+    <script type="module">
+      import { run_page } from "./harness.mjs";
+
+      const status = document.querySelector("#status");
+      try {
+        const result = await run_page();
+        status.textContent = result.ok
+          ? `done: ${result.rows.length} checks, all within tolerance`
+          : `done: ${result.rows.filter((row) => row.status !== "pass").length} check(s) failed`;
+      } catch (error) {
+        // A page that throws must still answer the driver, or a broken run looks
+        // like a hanging one.
+        status.textContent = `harness error: ${String(error)}`;
+        window.__result = {
+          ok: false,
+          rows: [{ name: "page", status: "error", detail: "uncaught", message: String(error) }],
+          notes: [],
+        };
+      }
+    </script>
+  </body>
+</html>
