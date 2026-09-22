@@ -78,6 +78,12 @@ export const TOLERANCES = {
     attention: { atol: 1e-4, rtol: 1e-4 },
     // One exp() and one division per element, values in [-8, 8].
     silu_mul: { atol: 1e-5, rtol: 1e-5 },
+    // GELU is one `exp` and the `erfc` polynomial, both the adapter's arithmetic. The polynomial's
+    // own error is 1.2e-7, four orders below this bound.
+    gelu: { atol: 1e-5, rtol: 1e-5 },
+    // Same shape of reduction as rmsnorm, one more pass for the mean: accumulating 256 f32 values
+    // per step in a different order from the reference is where the difference comes from.
+    layernorm: { atol: 1e-4, rtol: 1e-4 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -106,6 +112,10 @@ const SHAPE = {
     dequant_rows: 8,
     dequant_cols: 128,
     silu_count: 1024,
+    gelu_count: 1024,
+    layernorm_rows: 32,
+    layernorm_cols: 256,
+    layernorm_eps: 1e-5,
 };
 
 // ---------------------------------------------------------------------------
@@ -213,6 +223,13 @@ function build_normalization_cases() {
     );
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
     const up = ref.random_vector(SHAPE.silu_count, 0x5eed_0007);
+    const gelu_input = ref.random_vector(SHAPE.gelu_count, 0x5eed_0008);
+    const layernorm_input = ref.random_vector(
+        SHAPE.layernorm_rows * SHAPE.layernorm_cols,
+        0x5eed_0009,
+    );
+    const layernorm_weight = ref.random_vector(SHAPE.layernorm_cols, 0x5eed_000a);
+    const layernorm_bias = ref.random_vector(SHAPE.layernorm_cols, 0x5eed_000b);
 
     return [
         {
@@ -275,6 +292,53 @@ function build_normalization_cases() {
             expected: ref.silu_mul_reference(gate, up, SHAPE.silu_count),
             tolerance: TOLERANCES.silu_mul,
             detail: `count ${SHAPE.silu_count}`,
+        },
+        {
+            name: "gelu",
+            shader: "gelu.wgsl",
+            entry_point: "gelu_main",
+            workgroup: [256, 1, 1],
+            bindings: [
+                { uniform: pack_uniform([SHAPE.gelu_count, 0, 0, 0]) },
+                { input: gelu_input },
+                { output: SHAPE.gelu_count },
+            ],
+            dispatch: [ceil_div(SHAPE.gelu_count, 256), 1, 1],
+            expected: ref.gelu_reference(gelu_input, SHAPE.gelu_count),
+            tolerance: TOLERANCES.gelu,
+            detail: `count ${SHAPE.gelu_count}`,
+        },
+        {
+            name: "layernorm",
+            shader: "layernorm.wgsl",
+            entry_point: "layernorm_main",
+            workgroup: [256, 1, 1],
+            bindings: [
+                {
+                    uniform: pack_uniform([
+                        SHAPE.layernorm_rows,
+                        SHAPE.layernorm_cols,
+                        f32_field(SHAPE.layernorm_eps),
+                        0,
+                    ]),
+                },
+                { input: layernorm_input },
+                { input: layernorm_weight },
+                { input: layernorm_bias },
+                { output: SHAPE.layernorm_rows * SHAPE.layernorm_cols },
+            ],
+            dispatch: [SHAPE.layernorm_rows, 1, 1],
+            expected: ref.layernorm_reference(
+                layernorm_input,
+                layernorm_weight,
+                layernorm_bias,
+                SHAPE.layernorm_rows,
+                SHAPE.layernorm_cols,
+                SHAPE.layernorm_eps,
+            ),
+            tolerance: TOLERANCES.layernorm,
+            detail: `rows ${SHAPE.layernorm_rows}, cols ${SHAPE.layernorm_cols}, ` +
+                `eps ${SHAPE.layernorm_eps}`,
         },
     ];
 }

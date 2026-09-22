@@ -23,6 +23,8 @@ export type WebGpuKernelName =
   | "rope"
   | "attention"
   | "silu_mul"
+  | "gelu"
+  | "layernorm"
   | "dequant_reference";
 
 /** What a shader declares at `@group(0) @binding(n)`. */
@@ -148,6 +150,32 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
       { binding: 2, kind: "storage-read", minBindingSizeBytes: 0 },
       { binding: 3, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  gelu: {
+    name: "gelu",
+    file: "gelu.wgsl",
+    entryPoint: "gelu_main",
+    workgroupSize: [256, 1, 1],
+    workgroupStorageBytes: 0,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  layernorm: {
+    name: "layernorm",
+    file: "layernorm.wgsl",
+    entryPoint: "layernorm_main",
+    workgroupSize: [256, 1, 1],
+    workgroupStorageBytes: 256 * 4,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 3, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 4, kind: "storage-read-write", minBindingSizeBytes: 0 },
     ],
   },
   dequant_reference: {

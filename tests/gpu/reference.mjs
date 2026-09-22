@@ -394,6 +394,64 @@ const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV1A_64_PRIME = 0x100000001b3n;
 const MASK_64 = 0xffffffffffffffffn;
 
+// The error function GELU needs, by the same `erfc` rational fit `src/core/math.zig` uses.
+//
+// Ported coefficient for coefficient rather than taken from the language's own `erf`: this reference
+// exists to say what the *core* computes, so a more accurate function here would report the core's
+// accurate approximation as an error.
+export function erf_reference(value) {
+    const sign = value < 0 ? -1 : 1;
+    const magnitude = Math.abs(value);
+    const t = 1 / (1 + 0.5 * magnitude);
+    const tau = t * Math.exp(-magnitude * magnitude - 1.26551223 +
+        t * (1.00002368 +
+            t * (0.37409196 +
+                t * (0.09678418 +
+                    t * (-0.18628806 +
+                        t * (0.27886807 +
+                            t * (-1.13520398 +
+                                t * (1.48851587 +
+                                    t * (-0.82215223 + t * 0.17087277)))))))));
+    return f32(sign * (1 - tau));
+}
+
+// `gelu` from src/core/math.zig: the exact (error-function) form, as torch's default computes it.
+export function gelu_reference(x, count) {
+    const out = new Float32Array(count);
+    for (let index = 0; index < count; index += 1) {
+        const value = x[index];
+        out[index] = f32(f32(0.5 * value) * (1 + erf_reference(f32(value * 0.70710678))));
+    }
+    return out;
+}
+
+// `layerNormInPlace` from src/core/math.zig.
+//
+// Two passes on purpose: the mean is gathered first, and the deviations are measured from it. A
+// single pass accumulating a sum and a sum of squares is algebraically equal and numerically
+// different, and the kernel under test mirrors the core's two passes for that reason.
+export function layernorm_reference(x, weight, bias, rows, cols, eps) {
+    const out = new Float32Array(rows * cols);
+    for (let row = 0; row < rows; row += 1) {
+        const base = row * cols;
+        let sum = 0;
+        for (let column = 0; column < cols; column += 1) sum += x[base + column];
+        const mean = f32(sum / cols);
+        let squared = 0;
+        for (let column = 0; column < cols; column += 1) {
+            const centered = f32(x[base + column] - mean);
+            squared += centered * centered;
+        }
+        const variance = f32(squared / cols);
+        const inverse_std = f32(1 / Math.sqrt(variance + eps));
+        for (let column = 0; column < cols; column += 1) {
+            const centered = f32(x[base + column] - mean);
+            out[base + column] = f32(f32(centered * inverse_std) * weight[column] + bias[column]);
+        }
+    }
+    return out;
+}
+
 export function fnv1a_64(byte_arrays) {
     let hash = FNV1A_64_OFFSET_BASIS;
     for (const bytes of byte_arrays) {
