@@ -26,3 +26,6 @@ coverage/
 
 # mdBook build output
 docs/book/
+
+# The browser demo staged into the book by tools/book/stage-demo.mjs
+docs/src/demo/

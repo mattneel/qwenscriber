@@ -52,7 +52,9 @@
     <h1>Qwenscriber</h1>
     <p class="lede">
       Local-first Qwen3-ASR runtime. This page reports what the host supports, runs the core's
-      self-test, and preprocesses a tone with the real WASM module in a worker.
+      self-test, preprocesses a tone with the real WASM module in a worker, and runs one WebGPU
+      kernel (<code>matmul_q4</code>, fused dequantize + matmul over the packed weight layout)
+      against the same CPU reference the GPU test harness uses.
       Transcription is <em>not</em> implemented in ABI v1, and the last section shows the typed error
       that says so rather than a fake transcript.
     </p>
@@ -82,6 +84,21 @@
       </tbody>
     </table>
 
+    <h2>WebGPU (adapter, upload plan, and one kernel end to end)</h2>
+    <table>
+      <tbody>
+        <tr><th>Adapter request</th><td id="gpu-adapter-request">running...</td></tr>
+        <tr><th>Adapter identity</th><td id="gpu-adapter">running...</td></tr>
+        <tr><th>Adapter class</th><td id="gpu-degraded">running...</td></tr>
+        <tr><th>Measured limits</th><td id="gpu-limits">running...</td></tr>
+        <tr><th>Device features</th><td id="gpu-features">running...</td></tr>
+        <tr><th>Upload plan</th><td id="gpu-plan">running...</td></tr>
+        <tr><th>matmul_q4 vs CPU reference</th><td id="gpu-matmul">running...</td></tr>
+        <tr><th>Outcome</th><td id="gpu-status">running...</td></tr>
+        <tr><th>matmul_q4 dispatch</th><td id="gpu-timing">not run</td></tr>
+      </tbody>
+    </table>
+
     <h2>Core self-test</h2>
     <table>
       <tbody>
@@ -102,6 +119,13 @@
         <tr><th>Padding value</th><td id="mel-padding">running...</td></tr>
         <tr><th>Loudest band at frame 40</th><td id="mel-band">running...</td></tr>
       </tbody>
+    </table>
+
+    <h2>Benchmark (preprocessing throughput, timed in this tab)</h2>
+    <table>
+      <tr><th>Cases</th><td id="bench-cases">not run</td></tr>
+      <tr><th>Best case</th><td id="bench-best">not run</td></tr>
+      <tr><th>Realtime factor</th><td id="bench-rtf">not run</td></tr>
     </table>
 
     <h2>Detokenization (ABI v1, miniature vocabulary)</h2>

@@ -180,10 +180,18 @@ def main() -> int:
 
     raw_text = processor.decode(generated, return_format="raw")
     parsed = processor.parse_output(raw_text)
+    # `parse_output` returns a list of segments in this transformers release and a
+    # single mapping in others, so both shapes are accepted rather than pinning
+    # this script to one version's return type.
+    record = parsed[0] if isinstance(parsed, list) else parsed
+    if not isinstance(record, dict) or "transcription" not in record:
+        raise SystemExit(f"unexpected parse_output shape: {type(parsed).__name__}")
     print("raw output:", repr(raw_text))
     print("parsed:", parsed)
-    (args.output / "transcription.txt").write_text(parsed["transcription"], encoding="utf-8")
-    print(f"transcription: {parsed['transcription']}")
+    # Written verbatim, marker and all: this file is the comparison target, so
+    # post-processing it here would hide a difference in the runtime.
+    (args.output / "transcription.txt").write_text(record["transcription"], encoding="utf-8")
+    print(f"transcription: {record['transcription']}")
     return 0
 
 

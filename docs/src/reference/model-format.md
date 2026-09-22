@@ -95,7 +95,8 @@ than an accident.
 | 132 | `token_eos_primary` | 151643 |
 | 136 | `token_eos_secondary` | 151645 |
 | 140 | `token_pad` | 151643 |
-| 144 | four reserved words | Must be zero; rejected otherwise |
+| 144 | `flags` | Bit 0 is `output_projection_tied`: the checkpoint ships no output projection and the token embedding doubles as the unembedding. Unknown bits are rejected, not ignored |
+| 148 | three reserved words | Must be zero; rejected otherwise |
 
 Validation rejects a configuration whose head geometry, mel geometry, chunk geometry, epsilons, rope
 base, or token ids cannot describe a real model. It also rejects a value that would make the

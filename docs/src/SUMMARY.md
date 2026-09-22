@@ -2,6 +2,7 @@
 
 - [Qwenscriber](introduction.md)
 - [Project status](status.md)
+- [Live demo](demo.md)
 
 # Getting started
 
