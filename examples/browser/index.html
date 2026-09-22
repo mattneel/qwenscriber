@@ -1,0 +1,131 @@
+<!doctype html>
+<!--
+  Qwenscriber browser example.
+
+  Serve it over http from the repository root -- `file://` is not a secure context, so workers and
+  `fetch` of the wasm module both fail there:
+
+      python3 -m http.server 8766 --bind 127.0.0.1     # from the repository root
+
+  then open http://127.0.0.1:8766/examples/browser/index.html
+
+  The page imports the compiled SDK (`packages/qwenscriber/dist/index.js`), so build it first:
+
+      cd packages/qwenscriber && npm install && npm run build     # tsc + copy the wasm into dist/
+
+  `npm run build` puts `qwenscriber_core.wasm` next to the compiled modules, which is where the SDK
+  looks for it by default. The page sets `window.__result` when it finishes, so a headless driver can
+  use it as a pass/fail gate instead of a screenshot.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- An empty data URL icon: without it Chrome requests /favicon.ico, which a bare static server
+         answers with a 404 that shows up in the console as a page error. -->
+    <link rel="icon" href="data:," />
+    <title>Qwenscriber -- capability and self-test report</title>
+    <style>
+      :root { color-scheme: dark light; }
+      body {
+        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        margin: 0 auto; max-width: 62rem; padding: 1.5rem; background: #101216; color: #e6e6e6;
+      }
+      h1 { font-size: 1.2rem; margin: 0 0 0.25rem; }
+      h2 { font-size: 0.95rem; margin: 1.5rem 0 0.5rem; color: #9fd0ff; }
+      p.lede { color: #a0a4ad; margin: 0 0 1rem; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid #262a31; }
+      th { color: #a0a4ad; font-weight: normal; width: 16rem; }
+      td.ok { color: #56d364; }
+      td.no { color: #ff7b72; }
+      td.warn { color: #e3b341; }
+      pre { background: #161a20; border: 1px solid #262a31; padding: 0.75rem; overflow-x: auto; }
+      button {
+        font: inherit; background: #1f6feb; color: #fff; border: 0; border-radius: 4px;
+        padding: 0.35rem 0.75rem; margin-right: 0.5rem; cursor: pointer;
+      }
+      button:disabled { background: #30363d; color: #8b949e; cursor: default; }
+    </style>
+  </head>
+  <body>
+    <h1>Qwenscriber</h1>
+    <p class="lede">
+      Local-first Qwen3-ASR runtime. This page reports what the host supports, runs the core's
+      self-test, and preprocesses a tone with the real WASM module in a worker.
+      Transcription is <em>not</em> implemented in ABI v1, and the last section shows the typed error
+      that says so rather than a fake transcript.
+    </p>
+
+    <h2>Versions and backend</h2>
+    <table>
+      <tbody>
+        <tr><th>SDK version</th><td id="sdk-version">probing...</td></tr>
+        <tr><th>ABI / core version</th><td id="core-version">probing...</td></tr>
+        <tr><th>Module (compiled / resident)</th><td id="module-bytes">probing...</td></tr>
+        <tr><th>Backend (requested -&gt; resolved)</th><td id="backend">probing...</td></tr>
+        <tr><th>Core location</th><td id="worker">probing...</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Host capabilities</h2>
+    <table>
+      <tbody>
+        <tr><th>WebGPU</th><td id="cap-webgpu">probing...</td></tr>
+        <tr><th>WebGPU adapter</th><td id="cap-adapter">probing...</td></tr>
+        <tr><th>WebGPU limits</th><td id="cap-limits">probing...</td></tr>
+        <tr><th>WASM SIMD</th><td id="cap-simd">probing...</td></tr>
+        <tr><th>WASM threads</th><td id="cap-threads">probing...</td></tr>
+        <tr><th>SharedArrayBuffer</th><td id="cap-sab">probing...</td></tr>
+        <tr><th>Workers</th><td id="cap-workers">probing...</td></tr>
+        <tr><th>Cross-origin isolated</th><td id="cap-coi">probing...</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Core self-test</h2>
+    <table>
+      <tbody>
+        <tr><th>Result</th><td id="selftest-result">running...</td></tr>
+        <tr><th>Failures (bit mask)</th><td id="selftest-failures">running...</td></tr>
+        <tr><th>Loudest mel band (1 kHz tone)</th><td id="selftest-band">running...</td></tr>
+        <tr><th>Silence log-mel value</th><td id="selftest-silence">running...</td></tr>
+        <tr><th>Quantization hash</th><td id="selftest-quant">running...</td></tr>
+        <tr><th>Log-mel hash</th><td id="selftest-mel">running...</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Preprocessing a 1 s, 1 kHz tone (48 kHz in -&gt; 16 kHz -&gt; log-mel)</h2>
+    <table>
+      <tbody>
+        <tr><th>Frames / features</th><td id="mel-shape">running...</td></tr>
+        <tr><th>Global max (log10)</th><td id="mel-max">running...</td></tr>
+        <tr><th>Padding value</th><td id="mel-padding">running...</td></tr>
+        <tr><th>Loudest band at frame 40</th><td id="mel-band">running...</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Detokenization (ABI v1, miniature vocabulary)</h2>
+    <table>
+      <tbody>
+        <tr><th>Byte-alphabet round trip</th><td id="detokenize">running...</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Transcription</h2>
+    <table>
+      <tbody>
+        <tr><th>Outcome</th><td id="transcribe">running...</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      <button id="rerun-selftest" type="button" disabled>Run self-test again</button>
+      <button id="rerun-mel" type="button" disabled>Preprocess the tone again</button>
+    </p>
+
+    <h2>Log</h2>
+    <pre id="log"></pre>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
