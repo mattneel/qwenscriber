@@ -86,8 +86,9 @@ python3 -m http.server 8791        # from the repository root
 # open http://127.0.0.1:8791/tests/browser/audio_capture.html, click "start", read window.__result
 ```
 
-That comparison is authoritative for 0.6B. It is not available for 1.7B, because no released
-`transformers` reads the 1.7B checkpoint's configuration and audio encoder; see the 1.7B row and the
+That comparison runs for either size, against the `-hf` repository each checkpoint publishes. It is
+not available for a *raw* checkpoint: `transformers` reads the conversion output, and pointing it at
+the conversion source produces errors that look like missing library support. See the 1.7B row and the
 notes in `tools/reference/prepare_hf_layout.py`.
 
 The GPU conformance harness (`node tests/gpu/harness.mjs`) needs a Chromium with WebGPU enabled and a
