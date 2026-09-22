@@ -96,11 +96,12 @@ GPU adapter; it is not part of the default command set.
 ## Not yet true
 
 - No release, package, or artifact has been published.
-- CI's Zig gate installed `version: master` while `build.zig.zon` pins
-  `0.17.0-dev.2251+1175a3e99`; by 2026-09-21 master had moved to `0.17.0-dev.2264+230c63650`, so the
-  gate ran a compiler the code was never written against and failed its first step. It now takes the
-  revision from `build.zig.zon`, which is what the pin is for. The TypeScript SDK job failed on the
-  end-to-end test described below and passes locally now that it is corrected.
+- The Zig gate failed on `main` before this work, and the reason was the repository's state rather
+  than the compiler: `tools/wasm_selftest.mjs` was committed while the `qw_features`, `qw_model_*`, and
+  `qw_decode_*` exports it checks still existed only in the working tree, so the gate built the module
+  from the commit and found them missing. Committing that work turned the gate green — verified by the
+  run for `34b2cad` — and the TypeScript SDK job needed the mel-frame expectation and the default
+  model corrected in the same way.
 - No performance number on this page has been measured under the benchmark hooks described in the
   architecture pages.
 
