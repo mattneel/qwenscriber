@@ -96,12 +96,14 @@ pub const Data = struct {
     source_name: []const u8,
 
     pub fn table(self: *const Data) tokenizer.TokenTable {
+        assert(self.offsets.len == self.count + 1);
         return .{ .offsets = self.offsets, .bytes = self.bytes, .count = self.count };
     }
 
-    /// Bytes the runtime's table occupies: offsets then strings.
+    /// Bytes the runtime's table occupies: the leading count, the offsets, then
+    /// the strings.
     pub fn tableBytes(self: *const Data) u64 {
-        return @as(u64, self.count + 1) * 4 + self.bytes.len;
+        return @as(u64, self.count + 1) * 4 + 4 + self.bytes.len;
     }
 
     /// Looks a token up by its literal text, which is how a configuration
@@ -229,6 +231,7 @@ fn entriesFromObject(
         count += 1;
     }
     assert(count == entries.len);
+    assert(entries.len == object.count());
     return entries;
 }
 
@@ -309,6 +312,7 @@ fn appendAdded(
     arena: std.mem.Allocator,
     entry: TokenSpecials,
 ) Error!void {
+    assert(entry.id <= token_id_max);
     for (added.items) |existing| {
         if (existing.id != entry.id) continue;
         // The same token described twice: keep the first description, but the
@@ -460,11 +464,20 @@ fn parseJson(arena: std.mem.Allocator, bytes: []const u8) !std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
 }
 
-/// Writes the runtime's table: `count + 1` little-endian offsets, then the
-/// concatenated token strings. The offsets are relative to the start of the
-/// string block, so the reader can index them directly.
+/// Writes the runtime's table: a little-endian `count`, then `count + 1`
+/// little-endian offsets, then the concatenated token strings. The offsets are
+/// relative to the start of the string block, so the reader can index them
+/// directly.
+///
+/// The leading count is not redundant with the manifest: the table is a
+/// standalone artifact, and the native reader (`src/cli/transcribe.zig`) has only
+/// this file to go on. Writing it only in the manifest is exactly the kind of
+/// converter/reader drift that a format version is supposed to prevent.
 pub fn writeTable(writer: *std.Io.Writer, data: *const Data) !void {
     assert(data.offsets.len == data.count + 1);
+    var count_buffer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buffer, data.count, .little);
+    try writer.writeAll(&count_buffer);
     for (data.offsets) |offset| {
         var buffer: [4]u8 = undefined;
         std.mem.writeInt(u32, &buffer, offset, .little);
@@ -504,7 +517,7 @@ test "a vocabulary and its added tokens become one contiguous table" {
     try std.testing.expectEqual(@as(u32, 13), data.offsets[4]);
     try std.testing.expectEqual(@as(u32, 23), data.offsets[5]);
     try std.testing.expectEqualStrings("abc<|im_end|><asr_text>", data.bytes);
-    try std.testing.expectEqual(@as(u64, 6 * 4 + 23), data.tableBytes());
+    try std.testing.expectEqual(@as(u64, 4 + 6 * 4 + 23), data.tableBytes());
     try std.testing.expectEqual(@as(usize, 0), diagnostics.gap_count);
 
     const table = data.table();
@@ -525,9 +538,10 @@ test "a vocabulary and its added tokens become one contiguous table" {
     defer written.deinit();
     try writeTable(&written.writer, &data);
     const bytes = written.written();
-    try std.testing.expectEqual(@as(usize, 6 * 4 + 23), bytes.len);
-    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[12..16], .little));
-    try std.testing.expectEqualStrings("abc<|im_end|><asr_text>", bytes[24..]);
+    try std.testing.expectEqual(@as(usize, 4 + 6 * 4 + 23), bytes.len);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, bytes[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[16..20], .little));
+    try std.testing.expectEqualStrings("abc<|im_end|><asr_text>", bytes[28..]);
 }
 
 test "a vocabulary gap or duplicate id is an error rather than a silent fill" {

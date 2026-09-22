@@ -122,10 +122,30 @@ pub const Config = extern struct {
     token_eos_secondary: u32,
     token_pad: u32,
 
-    reserved0: u32 = 0,
+    /// Optional model facts, one bit each. Bit 0 is `output_projection_tied`.
+    ///
+    /// The runtime reads only `config.bin` and the shards — it does not consult
+    /// the manifest — so a fact that changes how weights are *resolved* has to
+    /// live here. Tying is exactly that: a tied checkpoint ships no output
+    /// projection, and without this bit that absence is indistinguishable from a
+    /// missing tensor, which the loader rightly rejects.
+    ///
+    /// Unknown bits are rejected rather than ignored: a bit written by a newer
+    /// converter could mean anything, and guessing would silently change what the
+    /// model computes.
+    flags: u32 = 0,
     reserved1: u32 = 0,
     reserved2: u32 = 0,
     reserved3: u32 = 0,
+
+    /// The checkpoint has no separate output projection; the token embedding
+    /// doubles as the unembedding. The released 0.6B checkpoint is this case.
+    pub const flag_output_projection_tied: u32 = 1 << 0;
+    const known_flags: u32 = flag_output_projection_tied;
+
+    pub fn outputProjectionTied(self: *const Config) bool {
+        return self.flags & flag_output_projection_tied != 0;
+    }
 
     pub fn architectureKind(self: *const Config) Error!Architecture {
         const architecture: Architecture = @fromBackingInt(@intCast(self.architecture));
@@ -211,7 +231,7 @@ pub const Config = extern struct {
     pub fn validate(self: *const Config) Error!void {
         if (!std.mem.eql(u8, &self.magic, &magic_bytes)) return Error.BadMagic;
         if (self.format_version != format_version) return Error.BadVersion;
-        if (!self.reservedIsZero()) return Error.ReservedNotEmpty;
+        if (!self.flagsAreKnown()) return Error.ReservedNotEmpty;
         _ = try self.architectureKind();
 
         try requireRange(self.audio_d_model);
@@ -278,9 +298,13 @@ pub const Config = extern struct {
         }
     }
 
-    fn reservedIsZero(self: *const Config) bool {
-        return self.reserved0 == 0 and self.reserved1 == 0 and
-            self.reserved2 == 0 and self.reserved3 == 0;
+    /// True when every set flag bit is one this build understands and the
+    /// reserved words are untouched.
+    fn flagsAreKnown(self: *const Config) bool {
+        return self.flags & ~known_flags == 0 and
+            self.reserved1 == 0 and
+            self.reserved2 == 0 and
+            self.reserved3 == 0;
     }
 
     fn requireRange(value: u32) Error!void {
@@ -318,7 +342,7 @@ comptime {
     std.debug.assert(@offsetOf(Config, "audio_d_model") == 16);
     std.debug.assert(@offsetOf(Config, "text_hidden_size") == 60);
     std.debug.assert(@offsetOf(Config, "token_audio_start") == 104);
-    std.debug.assert(@offsetOf(Config, "reserved0") == 144);
+    std.debug.assert(@offsetOf(Config, "flags") == 144);
 }
 
 test "configuration geometry derives from the released 0.6B checkpoint" {
@@ -479,9 +503,26 @@ test "invalid configurations are rejected with a specific reason" {
     bad_version.format_version = format_version + 1;
     try std.testing.expectError(Error.BadVersion, bad_version.validate());
 
+    // Bit 0 is a known flag: the tied output projection. An unknown bit is a
+    // configuration written by a newer converter, and guessing its meaning would
+    // silently change what the model computes.
+    var tied = base;
+    tied.flags = Config.flag_output_projection_tied;
+    try tied.validate();
+    try std.testing.expect(tied.outputProjectionTied());
+
+    var bad_flags = base;
+    bad_flags.flags = 1 << 1;
+    try std.testing.expectError(Error.ReservedNotEmpty, bad_flags.validate());
+
     var bad_reserved = base;
-    bad_reserved.reserved0 = 1;
+    bad_reserved.reserved1 = 1;
     try std.testing.expectError(Error.ReservedNotEmpty, bad_reserved.validate());
+
+    var untied = base;
+    untied.flags = 0;
+    try untied.validate();
+    try std.testing.expect(!untied.outputProjectionTied());
 
     var bad_arch = base;
     bad_arch.architecture = 99;

@@ -96,11 +96,15 @@ pub fn linearF16(
     var row: u32 = 0;
     while (row < rows) : (row += 1) {
         const weight_row = weights[@as(usize, row) * cols ..][0..cols];
-        for (weight_row, row_scratch) |bits, *value| value.* = half_float.fromF16(bits);
+        // `row_scratch` is a shared reuse buffer sized for the widest layer in
+        // the model, so every use of it is the `cols`-long prefix, never the
+        // whole slice.
+        const scratch_row = row_scratch[0..cols];
+        for (weight_row, scratch_row) |bits, *value| value.* = half_float.fromF16(bits);
         var token: u32 = 0;
         while (token < tokens) : (token += 1) {
             const activation_row = x[@as(usize, token) * cols ..][0..cols];
-            out[@as(usize, token) * rows + row] = dotF32(row_scratch, activation_row);
+            out[@as(usize, token) * rows + row] = dotF32(scratch_row, activation_row);
         }
     }
 }
@@ -140,12 +144,15 @@ pub fn linearQuantized(
             quant.q4_scale_bytes_per_group ..];
         const row_data = data[@as(usize, row) * groups_per_row *
             quant.dataBytesPerGroup(format) ..];
-        quant.dequantizeRow(format, row_scales, row_data, row_scratch[0..cols]);
+        // See `linearF16`: the scratch is longer than `cols` by design, so the
+        // dequantized prefix is what gets dotted against the activation row.
+        const scratch_row = row_scratch[0..cols];
+        quant.dequantizeRow(format, row_scales, row_data, scratch_row);
 
         var token: u32 = 0;
         while (token < tokens) : (token += 1) {
             const activation_row = x[@as(usize, token) * cols ..][0..cols];
-            out[@as(usize, token) * rows + row] = dotF32(row_scratch, activation_row);
+            out[@as(usize, token) * rows + row] = dotF32(scratch_row, activation_row);
         }
     }
 }
@@ -296,6 +303,9 @@ pub fn rmsNorm(
 pub const ConvGeometry = struct {
     /// Output channels.
     out_channels: u32,
+    /// Input channels. The audio tower's first convolution is single channel;
+    /// the second and third take the previous stage's full width.
+    in_channels: u32 = 1,
     /// Height (frequency) of the input.
     in_height: u32,
     /// Width (time) of the input.
@@ -312,11 +322,14 @@ pub const ConvGeometry = struct {
 };
 
 /// Three-by-three, stride two, padding one convolution followed by a bias add
-/// and the GELU activation, over a single-channel input.
+/// and the GELU activation.
 ///
 /// The audio tower applies this three times with GELU in between, which is why
-/// the activation is fused here rather than left to the caller.
-pub fn conv2d1x3x3Stride2Gelu(
+/// the activation is fused here rather than left to the caller. Weights are
+/// `[out_channels][in_channels][3][3]`, input is `[in_channels][in_height][in_width]`,
+/// and output is `[out_channels][out_height][out_width]` -- the layouts the
+/// checkpoint and the previous stage already have, so nothing is repacked.
+pub fn conv3x3Stride2Gelu(
     out: []f32,
     input: []const f32,
     weights: []const u16,
@@ -325,55 +338,90 @@ pub fn conv2d1x3x3Stride2Gelu(
 ) Error!void {
     const out_height = geometry.outHeight();
     const out_width = geometry.outWidth();
-    if (input.len != @as(usize, geometry.in_height) * geometry.in_width) {
-        return Error.ShapeMismatch;
-    }
-    if (weights.len != @as(usize, geometry.out_channels) * geometry.kernel * geometry.kernel) {
-        return Error.ShapeMismatch;
-    }
+    const in_plane = @as(usize, geometry.in_height) * geometry.in_width;
+    const out_plane = @as(usize, out_height) * out_width;
+    const kernel_values = @as(usize, geometry.kernel) * geometry.kernel;
+    if (geometry.kernel != 3) return Error.ShapeMismatch;
+    if (input.len != in_plane * geometry.in_channels) return Error.ShapeMismatch;
+    if (weights.len != @as(usize, geometry.out_channels) *
+        geometry.in_channels * kernel_values) return Error.ShapeMismatch;
     if (bias.len != geometry.out_channels) return Error.ShapeMismatch;
-    if (out.len != @as(usize, geometry.out_channels) * out_height * out_width) {
-        return Error.ShapeMismatch;
-    }
+    if (out.len != out_plane * geometry.out_channels) return Error.ShapeMismatch;
 
     var channel: u32 = 0;
     while (channel < geometry.out_channels) : (channel += 1) {
-        // Decode this channel's nine weights once: they are reused for every
-        // output position, so reading them per position would dominate.
-        var kernel_weights: [9]f32 = undefined;
-        const kernel_values = geometry.kernel * geometry.kernel;
-        const weight_base = @as(usize, channel) * kernel_values;
-        for (0..kernel_values) |index| {
-            kernel_weights[index] = half_float.fromF16(weights[weight_base + index]);
-        }
-        const channel_bias = bias[channel];
+        const out_slice = out[@as(usize, channel) * out_plane ..][0..out_plane];
+        const weight_base = @as(usize, channel) * geometry.in_channels * kernel_values;
+        try convolveChannel(out_slice, input, weights[weight_base..], bias[channel], geometry);
+        for (out_slice) |*value| value.* = math.gelu(value.*);
+    }
+}
 
-        var out_row: u32 = 0;
-        while (out_row < out_height) : (out_row += 1) {
-            var out_column: u32 = 0;
-            while (out_column < out_width) : (out_column += 1) {
-                var accumulator = channel_bias;
-                var kernel_row: u32 = 0;
-                while (kernel_row < geometry.kernel) : (kernel_row += 1) {
-                    const in_row = @as(isize, @intCast(out_row * 2)) +
-                        @as(isize, @intCast(kernel_row)) - 1;
-                    if (in_row < 0 or in_row >= geometry.in_height) continue;
-                    var kernel_column: u32 = 0;
-                    while (kernel_column < geometry.kernel) : (kernel_column += 1) {
-                        const in_column = @as(isize, @intCast(out_column * 2)) +
-                            @as(isize, @intCast(kernel_column)) - 1;
-                        if (in_column < 0 or in_column >= geometry.in_width) continue;
-                        const sample = input[
-                            @as(usize, @intCast(in_row)) * geometry.in_width +
-                                @as(usize, @intCast(in_column))
-                        ];
-                        accumulator += kernel_weights[kernel_row * geometry.kernel + kernel_column] *
-                            sample;
-                    }
+/// One output channel's reduction over every input channel.
+///
+/// The nine weights of each `(out, in)` pair are decoded once per input channel
+/// rather than once per output position: at 480 channels the weight traffic would
+/// otherwise dominate the arithmetic.
+fn convolveChannel(
+    out: []f32,
+    input: []const f32,
+    weights: []const u16,
+    channel_bias: f32,
+    geometry: ConvGeometry,
+) Error!void {
+    const out_height = geometry.outHeight();
+    const out_width = geometry.outWidth();
+    const in_plane = @as(usize, geometry.in_height) * geometry.in_width;
+    const kernel_values = @as(usize, geometry.kernel) * geometry.kernel;
+    if (out.len != @as(usize, out_height) * out_width) return Error.ShapeMismatch;
+
+    @memset(out, channel_bias);
+    var in_channel: u32 = 0;
+    while (in_channel < geometry.in_channels) : (in_channel += 1) {
+        const channel_weights = weights[@as(usize, in_channel) * kernel_values ..][0..kernel_values];
+        const channel_input = input[@as(usize, in_channel) * in_plane ..][0..in_plane];
+        try convolvePlane(out, channel_input, channel_weights, geometry);
+    }
+}
+
+/// Adds one input channel's contribution into an output plane.
+fn convolvePlane(
+    out: []f32,
+    input: []const f32,
+    weights: []const u16,
+    geometry: ConvGeometry,
+) Error!void {
+    const out_height = geometry.outHeight();
+    const out_width = geometry.outWidth();
+    var kernel_weights: [9]f32 = undefined;
+    const kernel_values = @as(usize, geometry.kernel) * geometry.kernel;
+    if (kernel_values > kernel_weights.len) return Error.ShapeMismatch;
+    for (0..kernel_values) |index| kernel_weights[index] = half_float.fromF16(weights[index]);
+
+    var out_row: u32 = 0;
+    while (out_row < out_height) : (out_row += 1) {
+        var out_column: u32 = 0;
+        while (out_column < out_width) : (out_column += 1) {
+            var accumulator: f32 = 0.0;
+            var kernel_row: u32 = 0;
+            while (kernel_row < geometry.kernel) : (kernel_row += 1) {
+                const in_row = @as(isize, @intCast(out_row * 2)) +
+                    @as(isize, @intCast(kernel_row)) - 1;
+                if (in_row < 0 or in_row >= geometry.in_height) continue;
+                var kernel_column: u32 = 0;
+                while (kernel_column < geometry.kernel) : (kernel_column += 1) {
+                    const in_column = @as(isize, @intCast(out_column * 2)) +
+                        @as(isize, @intCast(kernel_column)) - 1;
+                    if (in_column < 0 or in_column >= geometry.in_width) continue;
+                    const sample = input[
+                        @as(usize, @intCast(in_row)) * geometry.in_width +
+                            @as(usize, @intCast(in_column))
+                    ];
+                    accumulator += kernel_weights[kernel_row * geometry.kernel + kernel_column] *
+                        sample;
                 }
-                out[(@as(usize, channel) * out_height + out_row) * out_width + out_column] =
-                    math.gelu(accumulator);
             }
+            out[@as(usize, out_row) * out_width + out_column] += accumulator;
         }
     }
 }
@@ -719,8 +767,9 @@ test "convolution matches a hand-computed three by three stride two result" {
     var out: [4]f32 = undefined;
     const bias = [_]f32{0.0};
     // Output is (3-1)/2+1 = 2 in each dimension.
-    try conv2d1x3x3Stride2Gelu(&out, &input, &weights, &bias, .{
+    try conv3x3Stride2Gelu(&out, &input, &weights, &bias, .{
         .out_channels = 1,
+        .in_channels = 1,
         .in_height = 3,
         .in_width = 3,
         .kernel = 3,
@@ -732,6 +781,50 @@ test "convolution matches a hand-computed three by three stride two result" {
     try std.testing.expectApproxEqAbs(math.gelu(3.0), out[1], 1e-5);
     try std.testing.expectApproxEqAbs(math.gelu(7.0), out[2], 1e-5);
     try std.testing.expectApproxEqAbs(math.gelu(9.0), out[3], 1e-5);
+}
+
+test "a multi-channel convolution reduces over channels in weight order" {
+    // The second and third convolutions of the audio tower are 480 input
+    // channels wide, so the kernel has to reduce over channels *and* keep the
+    // `[out][in][kh][kw]` weight layout the checkpoint uses. This case pins both:
+    // channel zero contributes its centre tap, channel one its top-left tap, and
+    // the four output positions differ only by which taps land inside the input.
+    var weights: [2 * 9]u16 = undefined;
+    const centre = [_]f32{ 0, 0, 0, 0, 1, 0, 0, 0, 0 };
+    const top_left = [_]f32{ 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (centre, 0..) |value, index| weights[index] = half_float.toF16(value);
+    for (top_left, 0..) |value, index| weights[9 + index] = half_float.toF16(value);
+
+    const input = [_]f32{
+        1, 2, 3, 4, 5, 6, 7, 8, 9, // channel zero
+        10, 20, 30, 40, 50, 60, 70, 80, 90, // channel one
+    };
+    var out: [4]f32 = undefined;
+    const bias = [_]f32{0.0};
+    try conv3x3Stride2Gelu(&out, &input, &weights, &bias, .{
+        .out_channels = 1,
+        .in_channels = 2,
+        .in_height = 3,
+        .in_width = 3,
+        .kernel = 3,
+    });
+    // Centre taps of channel zero: 1, 3, 7, 9. Channel one's top-left tap lands
+    // inside the input only for the last output position, where it reads the
+    // middle of channel one's second row, 50.
+    try std.testing.expectApproxEqAbs(math.gelu(1.0), out[0], 1e-5);
+    try std.testing.expectApproxEqAbs(math.gelu(3.0), out[1], 1e-5);
+    try std.testing.expectApproxEqAbs(math.gelu(7.0), out[2], 1e-5);
+    try std.testing.expectApproxEqAbs(math.gelu(59.0), out[3], 1e-5);
+
+    // A channel count that disagrees with the input is an error, not a partial
+    // convolution: reading past the input plane would be a silent overrun.
+    try std.testing.expectError(Error.ShapeMismatch, conv3x3Stride2Gelu(
+        &out,
+        &input,
+        &weights,
+        &bias,
+        .{ .out_channels = 1, .in_channels = 3, .in_height = 3, .in_width = 3, .kernel = 3 },
+    ));
 }
 
 test "windowed attention mixes only inside its window" {

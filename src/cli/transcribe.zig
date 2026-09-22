@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const started = nowMs(io);
-    const model_dir = try Io.Dir.cwd().openDir(io, options.model_path, .{});
+    const model_dir = try Io.Dir.cwd().openDir(io, options.model_path, .{ .iterate = true });
     defer model_dir.close(io);
 
     // Configuration first: it sizes everything else.

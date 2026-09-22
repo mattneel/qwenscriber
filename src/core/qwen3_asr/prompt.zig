@@ -53,7 +53,7 @@ pub const Words = struct {
         .{ .field = "language", .text = "language" },
         .{ .field = "newline", .text = "\n" },
         .{ .field = "space", .text = " " },
-        .{ .field = "asr_text_text", .text = "asr_text" },
+        .{ .field = "asr_text_text", .text = "<asr_text>" },
     };
 
     /// Resolves each word by scanning the vocabulary for an exact byte match.
@@ -71,12 +71,25 @@ pub const Words = struct {
 };
 
 fn findExact(table: *const tokenizer.TokenTable, text: []const u8) Error!u32 {
+    if (findExactRaw(table, text)) |id| return id;
+    // The table stores the byte alphabet: a space is "\u0120" and a newline is
+    // "\u010a". A template word written in ordinary bytes therefore has to be
+    // encoded before it can match, and only when it fails on its own.
+    var encoded_buffer: [64]u8 = undefined;
+    if (text.len > encoded_buffer.len / 2) return Error.MissingTemplateToken;
+    const encoded_length = tokenizer.encodeAlphabet(&encoded_buffer, text) orelse
+        return Error.MissingTemplateToken;
+    return findExactRaw(table, encoded_buffer[0..encoded_length]) orelse
+        Error.MissingTemplateToken;
+}
+
+fn findExactRaw(table: *const tokenizer.TokenTable, text: []const u8) ?u32 {
     var id: u32 = 0;
     while (id < table.count) : (id += 1) {
         const candidate = table.token(id) catch continue;
         if (std.mem.eql(u8, candidate, text)) return id;
     }
-    return Error.MissingTemplateToken;
+    return null;
 }
 
 /// Builds the token sequence the decoder is prompted with.
@@ -157,7 +170,7 @@ fn push(out: []u32, length: *usize, token: u32) Error!void {
 test "a template resolves from a real-shaped vocabulary" {
     // A miniature vocabulary holding the words the template needs.
     const texts = [_][]const u8{
-        "system", "user", "assistant", "language", "\n", " ", "asr_text",
+        "system", "user", "assistant", "language", "\n", " ", "<asr_text>",
     };
     var offsets: [texts.len + 1]u32 = undefined;
     var storage: [64]u8 = undefined;
@@ -172,7 +185,7 @@ test "resolution fails loudly when a word is absent" {
     var offsets: [texts.len + 1]u32 = undefined;
     var storage: [64]u8 = undefined;
     const table = buildTable(&texts, &offsets, &storage);
-    // The space and "asr_text" entries are missing.
+    // The space and "<asr_text>" entries are missing.
     try std.testing.expectError(Error.MissingTemplateToken, Words.resolve(&table));
 }
 
@@ -190,7 +203,7 @@ test "exact matching does not accept a spaced variant" {
 test "the prompt matches the released chat template" {
     const config = testConfig();
     const texts = [_][]const u8{
-        "system", "user", "assistant", "language", "\n", " ", "asr_text",
+        "system", "user", "assistant", "language", "\n", " ", "<asr_text>",
     };
     var offsets: [texts.len + 1]u32 = undefined;
     var storage: [64]u8 = undefined;
@@ -229,7 +242,7 @@ test "the prompt matches the released chat template" {
 test "a short buffer is reported rather than overrun" {
     const config = testConfig();
     const texts = [_][]const u8{
-        "system", "user", "assistant", "language", "\n", " ", "asr_text",
+        "system", "user", "assistant", "language", "\n", " ", "<asr_text>",
     };
     var offsets: [texts.len + 1]u32 = undefined;
     var storage: [64]u8 = undefined;
@@ -243,7 +256,7 @@ test "a short buffer is reported rather than overrun" {
 test "a forced language is refused rather than silently ignored" {
     const config = testConfig();
     const texts = [_][]const u8{
-        "system", "user", "assistant", "language", "\n", " ", "asr_text",
+        "system", "user", "assistant", "language", "\n", " ", "<asr_text>",
     };
     var offsets: [texts.len + 1]u32 = undefined;
     var storage: [64]u8 = undefined;

@@ -243,6 +243,44 @@ pub const Model = struct {
             self.config.max_positions * @sizeOf(f32);
     }
 
+    /// Bytes of scratch the model holds, *excluding* the key/value cache, which
+    /// `cacheBytes` reports on its own: a caller that budgets by adding the two
+    /// must not count the cache twice.
+    ///
+    /// The cache is identified by field name rather than by subtracting
+    /// `cacheBytes`, because the subtraction only holds for a model whose cache
+    /// buffers are already populated — and a caller asking what scratch it must
+    /// provide is asking about exactly the state where they are not.
+    pub fn scratchBytes(self: *const Model) u64 {
+        const info = @typeInfo(Scratch).@"struct";
+        var total: u64 = 0;
+        inline for (info.field_names, info.field_types) |field_name, field_type| {
+            // Every scratch buffer is an f32 slice, so summing lengths is a
+            // byte count with no per-buffer bookkeeping.
+            comptime std.debug.assert(field_type == []f32);
+            if (comptime isCacheBuffer(field_name)) continue;
+            const buffer: []f32 = @field(self.scratch, field_name);
+            total += @as(u64, buffer.len) * @sizeOf(f32);
+        }
+        return total;
+    }
+
+    /// The scratch buffers that belong to the key/value cache, by name.
+    ///
+    /// Renaming one is a compile error here rather than a silently inflated
+    /// scratch report, which is the failure the old subtraction-based version was
+    /// trying to catch from the other end.
+    fn isCacheBuffer(comptime field_name: []const u8) bool {
+        const cache_fields = [_][]const u8{ "cache_keys", "cache_values" };
+        inline for (cache_fields) |name| {
+            if (!@hasField(Scratch, name)) {
+                @compileError("a cache buffer was renamed: update scratchBytes' exclusion list");
+            }
+            if (std.mem.eql(u8, field_name, name)) return true;
+        }
+        return false;
+    }
+
     /// Resolves every required tensor out of the parsed shards.
     ///
     /// `shards` are expected to be the model's shards in any order; a tensor may
@@ -257,9 +295,10 @@ pub const Model = struct {
 
         var bindings = try arena.alloc(Binding, layout.Iterator.count(&config));
         var iterator = layout.Iterator.init(&config);
+        const tied_output = config.outputProjectionTied();
         var index: usize = 0;
         while (iterator.next()) |required| {
-            bindings[index] = try resolve(required, shards);
+            bindings[index] = try resolveRequired(&config, required, shards, tied_output);
             index += 1;
         }
 
@@ -420,9 +459,35 @@ pub const Model = struct {
         const d_model = config.audio_d_model;
         const conv_out_features = config.audioConvOutInputFeatures();
 
-        const mid_height = (config.mel_bins - 1) / 2 + 1;
         const last_height = frequency_bins;
-        const mid_width = (chunk_frames - 1) / 2 + 1;
+
+        // Each stage halves the frequency and time extent of the one before it.
+        // Writing them as a chain rather than as three literals is what keeps the
+        // third stage from being handed the second stage's input geometry, which
+        // is exactly the mistake the kernel's shape check caught.
+        const stages = [3]kernels.ConvGeometry{
+            .{
+                .out_channels = downsample,
+                .in_channels = 1,
+                .in_height = config.mel_bins,
+                .in_width = chunk_frames,
+                .kernel = 3,
+            },
+            .{
+                .out_channels = downsample,
+                .in_channels = downsample,
+                .in_height = (config.mel_bins - 1) / 2 + 1,
+                .in_width = (chunk_frames - 1) / 2 + 1,
+                .kernel = 3,
+            },
+            .{
+                .out_channels = downsample,
+                .in_channels = downsample,
+                .in_height = ((config.mel_bins - 1) / 2 + 1 - 1) / 2 + 1,
+                .in_width = ((chunk_frames - 1) / 2 + 1 - 1) / 2 + 1,
+                .kernel = 3,
+            },
+        };
 
         const chunk_count = (frames + chunk_frames - 1) / chunk_frames;
         var packed_count: u32 = 0;
@@ -442,41 +507,26 @@ pub const Model = struct {
                 @memcpy(self.scratch.mel_chunk[bin * chunk_frames ..][0..valid_frames], source);
             }
 
-            try kernels.conv2d1x3x3Stride2Gelu(
+            try kernels.conv3x3Stride2Gelu(
                 self.scratch.conv1,
                 self.scratch.mel_chunk,
                 self.conv1_weight,
                 self.conv1_bias,
-                .{
-                    .out_channels = downsample,
-                    .in_height = config.mel_bins,
-                    .in_width = chunk_frames,
-                    .kernel = 3,
-                },
+                stages[0],
             );
-            try kernels.conv2d1x3x3Stride2Gelu(
+            try kernels.conv3x3Stride2Gelu(
                 self.scratch.conv2,
                 self.scratch.conv1,
                 self.conv2_weight,
                 self.conv2_bias,
-                .{
-                    .out_channels = downsample,
-                    .in_height = mid_height,
-                    .in_width = mid_width,
-                    .kernel = 3,
-                },
+                stages[1],
             );
-            try kernels.conv2d1x3x3Stride2Gelu(
+            try kernels.conv3x3Stride2Gelu(
                 self.scratch.conv3,
                 self.scratch.conv2,
                 self.conv3_weight,
                 self.conv3_bias,
-                .{
-                    .out_channels = downsample,
-                    .in_height = mid_height,
-                    .in_width = mid_width,
-                    .kernel = 3,
-                },
+                stages[2],
             );
 
             // The reference permutes the convolution output to
@@ -759,6 +809,38 @@ fn activateFfn(
 
 const d_model_max = 4096;
 
+/// Resolves one tensor the inventory requires, tolerating the one absence a tied
+/// model is allowed to have.
+///
+/// A tied checkpoint ships no output projection: the embedding matrix *is* the
+/// unembedding, so the tensor legitimately does not exist. Substituting the
+/// embedding's binding keeps `bindings` fully initialized — later lookups scan
+/// every element — and leaves `load`'s output-projection fallback to do its job.
+/// A checkpoint that does ship a projection is used as-is even when the flag is
+/// set: bytes beat declarations, and the shape check inside `resolve` still
+/// rejects an embedding that does not match the projection's shape, which is what
+/// a broken tie looks like.
+fn resolveRequired(
+    config: *const model_config.Config,
+    required: layout.Required,
+    shards: []const *const container.File,
+    tied_output: bool,
+) Error!Binding {
+    if (!tied_output or required.kind != .decoder_output_weight) {
+        return resolve(required, shards);
+    }
+    return resolve(required, shards) catch |err| switch (err) {
+        // The embedding's own requirement, not a hand-built one: the layout
+        // already asserts that the two share a shape and a storage class.
+        Error.MissingTensor => {
+            const embedding = layout.find(config, .decoder_embed_tokens_weight, 0) orelse
+                return Error.MissingTensor;
+            return resolve(embedding, shards);
+        },
+        else => err,
+    };
+}
+
 fn resolve(required: layout.Required, shards: []const *const container.File) Error!Binding {
     var found: ?Binding = null;
     for (shards) |shard| {
@@ -885,7 +967,14 @@ fn allocateScratch(arena: std.mem.Allocator, config: *const model_config.Config)
         .conv_flat = try allocate(arena, f32, config.audioConvOutInputFeatures()),
         .mel_chunk = try allocate(arena, f32, config.mel_bins * chunk_frames),
         .conv1 = try allocate(arena, f32, downsample * mid_height * mid_width),
-        .conv2 = try allocate(arena, f32, downsample * mid_height * mid_width),
+        // Each convolution halves its input extent, and the kernel refuses a
+        // buffer that is not exactly its output size: conv2's buffer is sized for
+        // the second stage, not the first.
+        .conv2 = try allocate(
+            arena,
+            f32,
+            downsample * ((mid_height - 1) / 2 + 1) * ((mid_width - 1) / 2 + 1),
+        ),
         .conv3 = try allocate(arena, f32, downsample * frequency_bins * config.audioChunkSteps()),
         .encoder = try allocate(arena, f32, @as(usize, max_steps) * d_model),
         .encoder_qkv = try allocate(arena, f32, @as(usize, max_steps) * 3 * d_model),
@@ -931,6 +1020,36 @@ test "size helper rejects a cache beyond the hard position limit" {
     try std.testing.expectError(Error.CapacityExceeded, validateCapacity(&config));
     config.max_positions = 512;
     try validateCapacity(&config);
+}
+
+test "scratch bytes account for every populated buffer, without the cache" {
+    var config = testConfig();
+    // Chosen so the cache the configuration allows is exactly the two cache
+    // buffers this test fills: 2 * layers * heads * head_dim * positions * 4.
+    config.text_layers = 1;
+    config.text_key_value_heads = 1;
+    config.text_head_dim = 2;
+    config.max_positions = 16;
+    var model: Model = undefined;
+    model.config = config;
+    model.scratch = std.mem.zeroes(Scratch);
+    try std.testing.expectEqual(@as(u64, 0), model.scratchBytes());
+
+    var first: [4]f32 = undefined;
+    var second: [7]f32 = undefined;
+    model.scratch.logits = &first;
+    try std.testing.expectEqual(@as(u64, 16), model.scratchBytes());
+    model.scratch.hidden = &second;
+    try std.testing.expectEqual(@as(u64, 44), model.scratchBytes());
+
+    // The cache lives in the scratch too, and `cacheBytes` reports it on its
+    // own: filling both cache buffers must not change `scratchBytes`, or a
+    // caller budgeting by the sum would count the cache twice.
+    var cache: [32]f32 = undefined;
+    model.scratch.cache_keys = &cache;
+    model.scratch.cache_values = &cache;
+    try std.testing.expectEqual(@as(u64, 44), model.scratchBytes());
+    try std.testing.expectEqual(@as(u64, 256), model.cacheBytes());
 }
 
 test "sinusoidal positions match the reference construction" {

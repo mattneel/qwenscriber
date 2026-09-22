@@ -39,15 +39,20 @@ const assert = std.debug.assert;
 const model_config = qwenscriber.model_config;
 const tokenizer_file = @import("tokenizer_file.zig");
 
-/// Positions the decoder may address, i.e. the hard limit on the KV cache.
+/// Positions the decoder may address, i.e. the hard limit on the KV cache, and
+/// the value a conversion records unless the caller lowers it.
 ///
-/// The 0.6B checkpoint advertises `max_position_embeddings: 65536`, which at
+/// The released checkpoints advertise `max_position_embeddings: 65536`, which at
 /// 1024 key/value units per layer, 28 layers, and two bytes per unit would be a
-/// 3.7 GiB cache -- not something a browser can hold. A 30-second clip needs 390
-/// audio positions plus at most `max_decode_tokens` text positions, so 16384 is
-/// far more than the runtime can use and small enough to allocate. A checkpoint
-/// advertising less is honoured rather than overridden.
-pub const max_positions_default: u32 = 16384;
+/// 3.7 GiB cache -- more than a browser's linear memory holds. A 30-second clip
+/// needs 390 audio positions plus at most `max_decode_tokens` text positions, so
+/// 8192 is far more than any clip this runtime accepts can use while keeping the
+/// cache allocatable; it is also the bound `qwen3_asr.model.validateCapacity`
+/// enforces, so the default output of a conversion loads. Raise it with the
+/// converter's `--max-positions` for a host build with memory to spare, or lower
+/// it further for a small one. A checkpoint advertising less is honoured rather
+/// than overridden.
+pub const max_positions_default: u32 = qwenscriber.qwen3_asr.model.position_limit;
 
 /// Decoded tokens per request. A 30-second transcript is a few hundred tokens of
 /// text; the reference pipeline's own `max_new_tokens` (512 in the native
@@ -93,6 +98,9 @@ pub const Error = error{
     /// A declared sinusoidal position table is shorter than one chunk's
     /// post-convolution steps.
     PositionTableTooShort,
+    /// The requested position budget cannot hold even one chunk of audio, so no
+    /// clip could be transcribed at all.
+    PositionsTooFew,
     /// The configuration's dtype is not a 16- or 32-bit float.
     UnsupportedDtype,
     /// The audio start, end, or pad token id could not be resolved.
@@ -131,14 +139,20 @@ pub const Source = struct {
     tokenizer_config_json: ?[]const u8 = null,
     /// Added tokens (name and id) from the tokenizer files.
     specials: []const tokenizer_file.TokenSpecials = &.{},
+    /// Position budget the checkpoint's advertised value is clamped to. Not a
+    /// property of the checkpoint: it is how much key/value cache the model is
+    /// being prepared for.
+    positions_max: u32 = max_positions_default,
 };
 
 pub const Parsed = struct {
     config: model_config.Config,
-    /// The checkpoint's `tie_word_embeddings`. The converter decides tiedness
-    /// from the tensors themselves and cross-checks this flag; a configuration
-    /// that claims tiedness while shipping a different `lm_head` would produce
-    /// a model that reuses the embedding where the checkpoint did not.
+    /// The checkpoint's `tie_word_embeddings` claim. This is *not* the flag the
+    /// runtime reads: `model_config.flag_output_projection_tied` is set by the
+    /// converter, from the checkpoint's tensors, because only they show whether
+    /// the directory holds an output projection. A configuration that claims
+    /// tiedness while shipping a different `lm_head` is a checkpoint whose claim
+    /// the tensors overrule.
     output_is_tied: bool,
     /// dtype as written in `config.json` (`"bfloat16"`), for reporting.
     source_dtype: []const u8,
@@ -192,16 +206,26 @@ pub fn parse(
     config.audio_max_position_steps = config.audioChunkSteps();
     try checkPositionTable(&reader, audio, config.audio_max_position_steps);
 
-    // The checkpoint advertises as much as 65536 positions. The runtime honours
-    // a smaller claim but never allocates for a larger one.
+    // The checkpoint advertises as much as 65536 positions. The conversion is
+    // prepared for the caller's budget: never more than the checkpoint allows,
+    // never more than the caller asked for.
     const advertised = reader.optionalU32(
         text,
         "text_config.max_position_embeddings",
         &.{"max_position_embeddings"},
     ) orelse max_positions_default;
-    config.max_positions = @min(advertised, max_positions_default);
+    if (source.positions_max < config.audioChunkSteps()) return Error.PositionsTooFew;
+    config.max_positions = @min(advertised, source.positions_max);
     config.max_decode_tokens = max_decode_tokens_default;
     const dtype = try readDtype(&reader, model, diagnostics);
+
+    // Tying is a property of the weights: when the output projection and the
+    // token embedding are the same matrix, the shard set simply has no output
+    // projection. The runtime reads only `config.bin` and the shards, never the
+    // manifest, so the fact has to travel here or the absence is indistinguishable
+    // from a missing tensor.
+    const output_is_tied = readTiedFlag(model, text, audio);
+    if (output_is_tied) config.flags |= model_config.Config.flag_output_projection_tied;
 
     // Everything `config.json` alone decides is checked before the tokenizer
     // files are consulted: a model whose shape the runtime cannot represent
@@ -209,17 +233,23 @@ pub fn parse(
     try config.validate();
     try readTokenFields(source.specials, model, generation, token_config, &config, diagnostics);
     try requireTokensInVocabulary(&config);
+    assert(config.audio_max_position_steps == config.audioChunkSteps());
 
     return .{
         .config = config,
-        .output_is_tied = readTiedFlag(model, text, audio),
+        .output_is_tied = output_is_tied,
         .source_dtype = dtype,
         .config_positions_advertised = advertised,
     };
 }
 
 fn parseJson(arena: std.mem.Allocator, bytes: []const u8) Error!std.json.Value {
-    return std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
+    return std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        bytes,
+        .{},
+    ) catch |err| switch (err) {
         error.OutOfMemory => Error.OutOfMemory,
         else => Error.MalformedJson,
     };
@@ -285,6 +315,7 @@ const FieldReader = struct {
         field: []const u8,
         names: []const []const u8,
     ) ?u32 {
+        assert(names.len > 0);
         for (names) |name| {
             const value = object.get(name) orelse continue;
             switch (value) {
@@ -308,6 +339,7 @@ const FieldReader = struct {
         field: []const u8,
         names: []const []const u8,
     ) Error!f64 {
+        assert(names.len > 0);
         for (names) |name| {
             const value = object.get(name) orelse continue;
             switch (value) {
@@ -329,6 +361,7 @@ const FieldReader = struct {
         field: []const u8,
         names: []const []const u8,
     ) ?[]const u8 {
+        assert(names.len > 0);
         for (names) |name| {
             const value = object.get(name) orelse continue;
             switch (value) {
@@ -363,6 +396,7 @@ fn readAudioFields(
         &.{ "encoder_attention_heads", "num_attention_heads" },
     );
     if (heads == 0) return Error.ZeroHeadCount;
+    assert(heads > 0);
     config.audio_attention_heads = heads;
     config.audio_ffn_dim = try reader.u32Field(
         audio,
@@ -395,12 +429,18 @@ fn readAudioFields(
     // declared fewer key/value heads would need a layout the runtime does not
     // have, so it is rejected instead of silently reading the query heads for
     // all of them.
-    if (reader.optionalU32(audio, "audio_config.num_key_value_heads", &.{"num_key_value_heads"})) |kv| {
+    const kv_heads = reader.optionalU32(
+        audio,
+        "audio_config.num_key_value_heads",
+        &.{"num_key_value_heads"},
+    );
+    if (kv_heads) |kv| {
         if (kv != heads) return Error.HeadGeometryMismatch;
     }
     if (config.audio_d_model % config.audio_attention_heads != 0) {
         return Error.HeadGeometryMismatch;
     }
+    assert(config.audioHeadDim() > 0);
 }
 
 fn readTextFields(
@@ -408,7 +448,11 @@ fn readTextFields(
     text: std.json.ObjectMap,
     config: *model_config.Config,
 ) Error!void {
-    config.text_hidden_size = try reader.u32Field(text, "text_config.hidden_size", &.{"hidden_size"});
+    config.text_hidden_size = try reader.u32Field(
+        text,
+        "text_config.hidden_size",
+        &.{"hidden_size"},
+    );
     config.text_layers = try reader.u32Field(
         text,
         "text_config.num_hidden_layers",
@@ -425,6 +469,7 @@ fn readTextFields(
         &.{"num_key_value_heads"},
     );
     if (heads == 0 or kv_heads == 0) return Error.ZeroHeadCount;
+    assert(heads >= kv_heads);
     config.text_attention_heads = heads;
     config.text_key_value_heads = kv_heads;
     config.text_head_dim = try reader.u32Field(text, "text_config.head_dim", &.{"head_dim"});
@@ -496,6 +541,7 @@ fn readTokenFields(
         .token_config = token_config,
     };
 
+    assert(config.vocab_size > 0);
     config.token_audio_start = try resolveToken(context, .{
         .role = .audio_start,
         .id_fields = &.{"audio_start_token_id"},
@@ -604,7 +650,12 @@ fn resolveToken(context: TokenContext, query: TokenQuery) Error!u32 {
     }
     if (query.name_field.len > 0) {
         if (context.token_config) |token_config| {
-            if (context.reader.stringField(token_config, query.name_field, &.{query.name_field})) |name| {
+            const named = context.reader.stringField(
+                token_config,
+                query.name_field,
+                &.{query.name_field},
+            );
+            if (named) |name| {
                 if (context.fromName(name)) |id| return id;
             }
         }
@@ -808,7 +859,11 @@ test "both released configuration shapes parse to the same runtime configuration
     try std.testing.expectEqual(@as(u32, 28), config.text_layers);
     try std.testing.expectEqual(@as(u32, 13), config.audio_max_position_steps);
     try std.testing.expectEqual(@as(f32, 1e-5), config.audio_layer_norm_eps);
-    try std.testing.expectEqual(@as(u32, 16384), config.max_positions);
+    // The default budget is the runtime's own limit, not whatever the
+    // checkpoint claims: a cache larger than the runtime allocates would be a
+    // configuration the runtime rejects.
+    try std.testing.expectEqual(max_positions_default, config.max_positions);
+    try std.testing.expectEqual(qwenscriber.qwen3_asr.model.position_limit, config.max_positions);
     try std.testing.expectEqual(max_decode_tokens_default, config.max_decode_tokens);
     try std.testing.expectEqual(@as(u32, 65536), from_vllm.config_positions_advertised);
     // Ids the configuration supplies directly.
@@ -824,6 +879,57 @@ test "both released configuration shapes parse to the same runtime configuration
     try std.testing.expectEqual(@as(u32, 151645), config.token_eos_secondary);
     try std.testing.expectEqual(@as(u32, 151643), config.token_pad);
     try std.testing.expectEqualStrings("", diagnostics.field);
+}
+
+test "the position budget belongs to the caller, clamped by the checkpoint's claim" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const config_json =
+        \\{"model_type":"qwen3_asr","dtype":"bfloat16","audio_token_id":122,
+        \\ "audio_config":{"d_model":896,"encoder_layers":18,"encoder_attention_heads":14,
+        \\   "encoder_ffn_dim":3584,"downsample_hidden_size":480,"n_window":50,
+        \\   "n_window_infer":800,"output_dim":1024,"num_mel_bins":128,
+        \\   "max_position_embeddings":13},
+        \\ "text_config":{"hidden_size":1024,"num_hidden_layers":28,"num_attention_heads":16,
+        \\   "num_key_value_heads":8,"head_dim":128,"intermediate_size":3072,
+        \\   "vocab_size":151936,"rms_norm_eps":1e-06,"rope_theta":1000000,
+        \\   "max_position_embeddings":65536}}
+    ;
+    const specials = [_]tokenizer_file.TokenSpecials{
+        .{ .name = "<|endoftext|>", .id = 151643 },
+        .{ .name = "<|im_start|>", .id = 151644 },
+        .{ .name = "<|im_end|>", .id = 151645 },
+        .{ .name = "<|audio_start|>", .id = 151669 },
+        .{ .name = "<|audio_end|>", .id = 151670 },
+        .{ .name = "<|audio_pad|>", .id = 151676 },
+        .{ .name = "<asr_text>", .id = 151704 },
+    };
+    var diagnostics: Diagnostics = .{};
+
+    // The default is what the runtime's cache holds.
+    const default_budget = try parse(arena, .{
+        .config_json = config_json,
+        .specials = &specials,
+    }, &diagnostics);
+    try std.testing.expectEqual(max_positions_default, default_budget.config.max_positions);
+    try std.testing.expectEqual(@as(u32, 65536), default_budget.config_positions_advertised);
+
+    // A smaller budget is honoured: a host with less memory, or a runtime that
+    // wants a smaller cache, asks for one and gets it.
+    const smaller = try parse(arena, .{
+        .config_json = config_json,
+        .specials = &specials,
+        .positions_max = 1024,
+    }, &diagnostics);
+    try std.testing.expectEqual(@as(u32, 1024), smaller.config.max_positions);
+
+    // A budget below one chunk of audio cannot transcribe anything at all.
+    try std.testing.expectError(Error.PositionsTooFew, parse(arena, .{
+        .config_json = config_json,
+        .specials = &specials,
+        .positions_max = 4,
+    }, &diagnostics));
 }
 
 test "fields the configuration must supply are reported by name" {

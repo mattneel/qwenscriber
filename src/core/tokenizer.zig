@@ -66,6 +66,26 @@ pub const Error = error{
     OutputTooSmall,
 };
 
+/// Encodes raw bytes into the vocabulary's byte alphabet: the inverse of what
+/// `appendToken` decodes.
+///
+/// A tokenizer table stores `\u0120` for a space and `\u010a` for a newline, so a
+/// caller holding ordinary text ("assistant\n", "language ") has to encode it
+/// before it can be compared against a token. Returns null when `out` cannot hold
+/// the result.
+pub fn encodeAlphabet(out: []u8, text: []const u8) ?usize {
+    var length: usize = 0;
+    for (text) |byte| {
+        var codepoint_buffer: [4]u8 = undefined;
+        const encoded = std.unicode.utf8Encode(byteToCodepoint(byte), &codepoint_buffer) catch
+            return null;
+        if (length + encoded > out.len) return null;
+        @memcpy(out[length..][0..encoded], codepoint_buffer[0..encoded]);
+        length += encoded;
+    }
+    return length;
+}
+
 /// A read-only view of a vocabulary: token id -> token string.
 ///
 /// Both slices live in the model container, so a vocabulary costs no runtime

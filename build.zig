@@ -58,6 +58,18 @@ pub fn build(b: *std.Build) void {
 
     // --- native tools ---
 
+    // Checkpoint reading, name mapping, and conversion. Kept in its own module
+    // because none of it is compiled for the freestanding target: it uses
+    // `std.json`, an allocator, and the operating system.
+    const host = b.addModule("host", .{
+        .root_source_file = b.path("src/host/root.zig"),
+        .target = host_target,
+        .optimize = host_optimize,
+        .imports = &.{
+            .{ .name = "qwenscriber", .module = core },
+        },
+    });
+
     const selftest_exe = b.addExecutable(.{
         .name = "qwenscriber-selftest",
         .root_module = b.createModule(.{
@@ -87,6 +99,34 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(transcribe_exe);
+
+    const convert_exe = b.addExecutable(.{
+        .name = "qwenscriber-convert",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli/convert.zig"),
+            .target = host_target,
+            .optimize = host_optimize,
+            .imports = &.{
+                .{ .name = "qwenscriber", .module = core },
+                .{ .name = "host", .module = host },
+            },
+        }),
+    });
+    b.installArtifact(convert_exe);
+
+    const inspect_exe = b.addExecutable(.{
+        .name = "qwenscriber-inspect",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli/inspect.zig"),
+            .target = host_target,
+            .optimize = host_optimize,
+            .imports = &.{
+                .{ .name = "qwenscriber", .module = core },
+                .{ .name = "host", .module = host },
+            },
+        }),
+    });
+    b.installArtifact(inspect_exe);
 
     // --- tests ---
 
@@ -122,10 +162,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    // Checkpoint reading, name mapping, and conversion own the larger share of
+    // the tests; none of it needs the WASM target.
+    const host_tests = b.addTest(.{ .root_module = host });
+    const run_host_tests = b.addRunArtifact(host_tests);
+
     const test_step = b.step("test", "Run unit tests and reference comparisons");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_reference_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_host_tests.step);
 
     // `zig build test-wasm` proves the freestanding module instantiates and
     // computes correctly inside a real JavaScript engine.
@@ -150,5 +196,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&run_core_tests.step);
     check_step.dependOn(&run_reference_tests.step);
     check_step.dependOn(&run_cli_tests.step);
+    check_step.dependOn(&run_host_tests.step);
     check_step.dependOn(&wasm_selftest.step);
 }

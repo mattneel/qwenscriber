@@ -42,7 +42,6 @@ const half_float = qwenscriber.half_float;
 const layout = qwenscriber.qwen3_asr.layout;
 const model_config = qwenscriber.model_config;
 const quant = qwenscriber.quant;
-const tensor = qwenscriber.tensor;
 
 const checkpoint_config = @import("checkpoint_config.zig");
 const manifest = @import("manifest.zig");
@@ -77,14 +76,15 @@ pub const Options = struct {
     input_dir: std.Io.Dir,
     /// Model directory, which the caller has already created.
     output_dir: std.Io.Dir,
-    /// Directory names, for the report and the summary table.
-    input_name: []const u8 = "checkpoint",
-    output_name: []const u8 = "model",
     /// Identifier recorded in the manifest. The CLI defaults it to the input
     /// directory's name.
     model_id: []const u8,
     quantization: dtype.Format = .q4,
     shard_bytes_max: u64 = shard_bytes_default,
+    /// Position budget the checkpoint's advertised value is clamped to, i.e.
+    /// how much key/value cache the model is being prepared for. The default is
+    /// the runtime's own limit; a host build may raise it.
+    positions_max: u32 = checkpoint_config.max_positions_default,
     /// Re-read every shard and compare it against the checkpoint.
     verify: bool = false,
 };
@@ -140,6 +140,12 @@ pub const Report = struct {
     output_is_tied: bool,
     /// Checkpoint tensors no rule recognized, which the model does not need.
     unused_tensors: u32,
+    /// Positions the runtime will allocate for, from the written configuration.
+    positions_used: u32,
+    /// Positions the checkpoint advertised, which the runtime clamps to its own
+    /// budget. Reported so an operator can see why `positions_used` is what it
+    /// is.
+    positions_advertised: u32,
     shards: []const ShardReport,
     verify: VerifyReport,
 };
@@ -183,8 +189,8 @@ pub fn run(
 ) !Report {
     var token_diagnostics: tokenizer_file.Diagnostics = .{};
     const tokens = try tokenizer_file.read(arena, io, options.input_dir, &token_diagnostics);
-    const checkpoint = try readCheckpointConfig(arena, io, options.input_dir, tokens);
-    const config = checkpoint.config;
+    const checkpoint = try readCheckpointConfig(arena, io, options.input_dir, tokens, options);
+    var config = checkpoint.config;
 
     const source = try safetensors.Checkpoint.open(arena, io, options.input_dir);
     const names = try source.names(arena);
@@ -199,6 +205,7 @@ pub fn run(
         .classification = &classification,
         .diagnostics = diagnostics,
         .config_output_is_tied = checkpoint.output_is_tied,
+        .positions_advertised = checkpoint.config_positions_advertised,
         .verify_arena = std.heap.ArenaAllocator.init(arena),
     };
     defer driver.verify_arena.deinit();
@@ -221,6 +228,7 @@ fn readCheckpointConfig(
     io: std.Io,
     dir: std.Io.Dir,
     tokens: tokenizer_file.Data,
+    options: Options,
 ) !checkpoint_config.Parsed {
     const config_json = dir.readFileAlloc(io, "config.json", arena, .limited(1 << 20)) catch |err| {
         return switch (err) {
@@ -234,6 +242,7 @@ fn readCheckpointConfig(
         .generation_json = readTextFile(arena, io, dir, "generation_config.json"),
         .tokenizer_config_json = readTextFile(arena, io, dir, "tokenizer_config.json"),
         .specials = tokens.specials,
+        .positions_max = options.positions_max,
     }, &diagnostics);
 }
 
@@ -253,7 +262,10 @@ const Driver = struct {
     arena: std.mem.Allocator,
     io: std.Io,
     options: Options,
-    config: *const model_config.Config,
+    /// The configuration being written. It is the driver's to update: which
+    /// flags the model directory carries is decided by the tensors, not by the
+    /// checkpoint's claims about them.
+    config: *model_config.Config,
     source: *const safetensors.Checkpoint,
     classification: *const tensor_names.Classification,
     diagnostics: *Diagnostics,
@@ -273,6 +285,9 @@ const Driver = struct {
     verify_arena: std.heap.ArenaAllocator,
     /// What the checkpoint's configuration claims about the output projection.
     config_output_is_tied: bool = false,
+    /// What the checkpoint's configuration advertises for the decoder's position
+    /// budget, before the runtime's own clamp.
+    positions_advertised: u32 = 0,
     /// True when the decoder's output projection is the token embedding and is
     /// therefore not stored separately.
     output_is_tied: bool = false,
@@ -292,6 +307,17 @@ const Driver = struct {
             self.scratch,
             self.other,
         );
+        // The runtime's loader reads this flag to decide whether a missing
+        // `decoder.output.weight` is legal, so the written configuration states
+        // what the checkpoint's tensors showed. A configuration written without
+        // it would make the loader demand an output projection that a tied
+        // checkpoint does not have.
+        if (self.output_is_tied) {
+            self.config.flags |= model_config.Config.flag_output_projection_tied;
+        } else {
+            self.config.flags &= ~model_config.Config.flag_output_projection_tied;
+        }
+        assert(self.config.outputProjectionTied() == self.output_is_tied);
     }
 
     /// Every inventory position must be filled, and the checkpoint must not
@@ -344,6 +370,7 @@ const Driver = struct {
         const index = slot.source_index orelse {
             return self.reportMissing(required, "missing from the checkpoint");
         };
+        assert(index < self.source.tensors.len);
         return self.source.tensors[index];
     }
 
@@ -366,6 +393,7 @@ const Driver = struct {
             self.diagnostics.detail = "cannot be stored in the requested format";
             return Error.NotQuantizable;
         };
+        assert(len_bytes > 0);
         try self.startShardIfNeeded(required.layer, len_bytes);
         try self.appendPayload(entry_source, required, format, len_bytes);
         self.tensors += 1;
@@ -390,6 +418,8 @@ const Driver = struct {
         const start = self.payload.items.len;
         try self.payload.appendNTimes(self.arena, 0, @intCast(len_bytes));
         const payload = self.payload.items[start..][0..@intCast(len_bytes)];
+        assert(payload.len == len_bytes);
+        assert((start + offset) % quant.tensor_alignment_bytes == 0);
         try fillPayload(entry_source, required, format, payload, self.scratch, self.diagnostics);
         try self.entries.append(self.arena, .{
             .kind = @backingInt(required.kind),
@@ -410,6 +440,7 @@ const Driver = struct {
         const previous = self.entries.items[self.entries.items.len - 1];
         if (previous.layer == layer) return;
         if (self.payload.items.len + next_bytes <= self.options.shard_bytes_max) return;
+        assert(next_bytes > 0);
         try self.finishShard();
     }
 
@@ -473,6 +504,8 @@ const Driver = struct {
         // The container's own validation runs before the bytes reach a file: a
         // shard the runtime would reject must never be written.
         try header.validate();
+        assert(header.payload_offset_bytes % container.payload_alignment == 0);
+        assert(self.entries.items.len > 0);
 
         var file = try self.options.output_dir.createFile(self.io, name, .{ .truncate = true });
         defer file.close(self.io);
@@ -511,6 +544,7 @@ const Driver = struct {
     /// Re-reads a written shard and compares every tensor in it against the
     /// checkpoint it came from.
     fn verifyShard(self: *Driver, name: []const u8) !void {
+        assert(self.options.verify);
         _ = self.verify_arena.reset(.retain_capacity);
         const bytes = try self.options.output_dir.readFileAllocOptions(
             self.io,
@@ -530,7 +564,14 @@ const Driver = struct {
                 index_entry.layer,
             ) orelse return Error.VerificationFailed;
             const entry_source = try self.sourceTensor(required);
-            try compareTensor(file, index_entry, entry_source, self.scratch, self.other, &self.verify);
+            try compareTensor(
+                file,
+                index_entry,
+                entry_source,
+                self.scratch,
+                self.other,
+                &self.verify,
+            );
         }
     }
 
@@ -540,6 +581,8 @@ const Driver = struct {
         tokenizer_bytes: u64,
         merges_bytes: u64,
     ) !u64 {
+        assert(self.shards.items.len > 0);
+        assert(self.payload_bytes > 0);
         const shards = try self.arena.alloc(manifest.Shard, self.shards.items.len);
         for (self.shards.items, 0..) |shard, index| {
             shards[index] = .{
@@ -612,6 +655,8 @@ const Driver = struct {
             .merges_bytes = merges_bytes,
             .output_is_tied = self.output_is_tied,
             .unused_tensors = @intCast(self.classification.unknown.len),
+            .positions_used = self.config.max_positions,
+            .positions_advertised = self.positions_advertised,
             .shards = self.shards.items,
             .verify = self.verify,
         };
@@ -621,6 +666,7 @@ const Driver = struct {
 /// Scratch length: a whole matrix row, or an element chunk, whichever is larger.
 fn scratchElements(config: *const model_config.Config) u32 {
     var elements: u32 = element_chunk_max;
+    assert(elements > 0);
     var iterator = layout.Iterator.init(config);
     while (iterator.next()) |required| {
         if (required.shape.rank != 2) continue;
@@ -673,6 +719,7 @@ fn tensorsEqual(
     if (left.data.len == right.data.len) {
         if (std.mem.eql(u8, left.data, right.data)) return true;
     }
+    assert(scratch.len == other.len);
     const count = try left.elementCount();
     if (try right.elementCount() != count) return false;
     var offset: u64 = 0;
@@ -696,8 +743,16 @@ fn fillPayload(
     scratch: []f32,
     diagnostics: *Diagnostics,
 ) !void {
+    assert(payload.len > 0);
     switch (format) {
-        .q4, .q5, .q8 => try quantizeMatrix(source, required, format, payload, scratch, diagnostics),
+        .q4, .q5, .q8 => try quantizeMatrix(
+            source,
+            required,
+            format,
+            payload,
+            scratch,
+            diagnostics,
+        ),
         .f16 => try writeElements(source, payload, 2, scratch, diagnostics),
         .f32 => try writeElements(source, payload, 4, scratch, diagnostics),
         else => unreachable,
@@ -727,7 +782,8 @@ fn quantizeMatrix(
     while (row < rows) : (row += 1) {
         try source.decodeRangeF32(@as(u64, row) * cols, values);
         try requireFinite(values, source.name, diagnostics);
-        const scales = payload[plane.scales_offset_bytes + row * scales_row_bytes ..][0..scales_row_bytes];
+        const scales_at = plane.scales_offset_bytes + row * scales_row_bytes;
+        const scales = payload[scales_at..][0..scales_row_bytes];
         const codes = payload[plane.data_offset_bytes + row * data_row_bytes ..][0..data_row_bytes];
         quant.quantizeRow(format, values, scales, codes);
     }
@@ -789,6 +845,7 @@ fn compareTensor(
     const shape = try entry.shape();
     if (!shape.eql(&source.shape)) return Error.VerificationFailed;
     report.tensors_compared += 1;
+    assert(entry.len_bytes > 0);
 
     if (format.isQuantized()) {
         const planes = file.quantizedPlanes(entry.kind, entry.layer) orelse
@@ -1108,7 +1165,8 @@ fn tinyValues(arena: std.mem.Allocator, count: u64, seed: f32) ![]u8 {
     while (index < count) : (index += 1) {
         const position: f32 = @floatFromInt(index);
         const value = @sin(position * 0.017 + seed) * 0.25 + @cos(position * 0.0031) * 0.05;
-        std.mem.writeInt(u16, bytes[@intCast(index * 2)..][0..2], half_float.toBf16(value), .little);
+        const at: usize = @intCast(index * 2);
+        std.mem.writeInt(u16, bytes[at..][0..2], half_float.toBf16(value), .little);
     }
     return bytes;
 }
@@ -1217,12 +1275,78 @@ fn tinyName(arena: std.mem.Allocator, required: layout.Required) ![]const u8 {
     return arena.dupe(u8, name);
 }
 
-fn storedTensorLessThan(context: void, lhs: safetensors.StoredTensor, rhs: safetensors.StoredTensor) bool {
+fn storedTensorLessThan(
+    context: void,
+    lhs: safetensors.StoredTensor,
+    rhs: safetensors.StoredTensor,
+) bool {
     _ = context;
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
 
 // --- the conversion contract ------------------------------------------------
+
+test "the converted vocabulary carries the words the prompt template resolves" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    // The runtime's prompt template resolves a handful of ordinary words from
+    // the vocabulary by exact byte comparison, so what those bytes are is part
+    // of the contract between the converter and the runtime. The table is the
+    // byte-to-unicode alphabet (`tokenizer.zig` undoes it at decode time), which
+    // means:
+    //
+    //   * `system`, `user`, `assistant`, `language` are plain ASCII and appear
+    //     both bare and with a leading `Ġ`;
+    //   * a space is the single token `Ġ` (U+0120), not a literal space: no
+    //     vocabulary has a literal 0x20 token, and one would make
+    //     `tokenizer.appendToken` reject the whole table;
+    //   * a newline is `Ċ` (U+010A);
+    //   * the language hint's marker is the added token `<asr_text>`, brackets
+    //     included.
+    //
+    // The released checkpoint is a download, so this checks what is present and
+    // skips the rest.
+    const expected = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "system", .value = "system" },
+        .{ .name = "user", .value = "user" },
+        .{ .name = "assistant", .value = "assistant" },
+        .{ .name = "language", .value = "language" },
+        .{ .name = "space", .value = "\u{0120}" },
+        .{ .name = "newline", .value = "\u{010A}" },
+        .{ .name = "asr marker", .value = "<asr_text>" },
+    };
+    const paths = [_][]const u8{
+        "models/Qwen3-ASR-0.6B",
+        "models/Qwen3-ASR-0.6B-hf",
+    };
+    for (paths) |path| {
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch continue;
+        defer dir.close(io);
+        var diagnostics: tokenizer_file.Diagnostics = .{};
+        const tokens = tokenizer_file.read(arena, io, dir, &diagnostics) catch continue;
+        for (expected) |entry| {
+            const id = tokens.idOf(entry.value) orelse {
+                // The added-token names carry the id; a plain vocabulary word
+                // does not, so scan the table for it.
+                const table = tokens.table();
+                var found: ?u32 = null;
+                var id_candidate: u32 = 0;
+                while (id_candidate < tokens.count) : (id_candidate += 1) {
+                    const token = table.token(id_candidate) catch continue;
+                    if (std.mem.eql(u8, token, entry.value)) found = id_candidate;
+                }
+                try std.testing.expect(found != null);
+                continue;
+            };
+            // The token at that id is byte for byte the text looked up.
+            const table = tokens.table();
+            try std.testing.expectEqualStrings(entry.value, try table.token(id));
+        }
+    }
+}
 
 /// Reads a file from the model directory the conversion produced.
 fn readModelFile(
@@ -1254,7 +1378,11 @@ fn expectModelDirectory(
     report: Report,
     expected: ExpectedModel,
 ) !void {
-    try expectConfigFile(arena, io, dir, config);
+    // The tie flag is a property of the weights, so the converter writes it from
+    // what it found in the checkpoint rather than from `config.json`; the
+    // comparison against `config` therefore only extends to the flag, which
+    // `expectConfigFile` checks against what the caller expects of the shards.
+    try expectConfigFile(arena, io, dir, config, expected.output_is_tied);
     try expectTokenFile(arena, io, dir, report.token_count);
 
     const manifest_bytes = try readModelFile(arena, io, dir, "manifest.json");
@@ -1361,6 +1489,7 @@ fn expectConfigFile(
     io: std.Io,
     dir: std.Io.Dir,
     config: *const model_config.Config,
+    output_is_tied: bool,
 ) !void {
     const bytes = try dir.readFileAllocOptions(
         io,
@@ -1371,20 +1500,29 @@ fn expectConfigFile(
         null,
     );
     const parsed = try model_config.parse(bytes);
+    // The only field the converter decides that the checkpoint's configuration
+    // does not carry is the tiedness flag, which says whether the directory has
+    // an output projection at all.
+    var expected = config.*;
+    expected.flags = if (output_is_tied) model_config.Config.flag_output_projection_tied else 0;
+    try std.testing.expectEqual(expected.flags, parsed.flags);
+    try std.testing.expectEqual(output_is_tied, parsed.outputProjectionTied());
     try std.testing.expectEqualSlices(
         u8,
-        std.mem.asBytes(config),
+        std.mem.asBytes(&expected),
         std.mem.asBytes(parsed),
     );
 }
 
-/// The offset of a token in the table, read the way the runtime reads it.
+/// The offset of a token in the table, read the way the runtime reads it: past
+/// the leading `count`, then one `u32` per entry.
 fn tokenOffset(bytes: []const u8, id: u32) u32 {
-    return std.mem.readInt(u32, bytes[@as(usize, id) * 4 ..][0..4], .little);
+    return std.mem.readInt(u32, bytes[4 + @as(usize, id) * 4 ..][0..4], .little);
 }
 
-/// The token table is `count + 1` offsets followed by the concatenated strings,
-/// so the added tokens must land at the ids the tokenizer files gave them.
+/// The token table is a `count`, then `count + 1` offsets, then the concatenated
+/// strings, so the added tokens must land at the ids the tokenizer files gave
+/// them.
 fn expectTokenFile(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1392,9 +1530,10 @@ fn expectTokenFile(
     token_count: u32,
 ) !void {
     const bytes = try readModelFile(arena, io, dir, "tokens.bin");
+    try std.testing.expectEqual(token_count, std.mem.readInt(u32, bytes[0..4], .little));
     const offsets_bytes = @as(usize, token_count + 1) * 4;
-    try std.testing.expect(bytes.len > offsets_bytes);
-    const text = bytes[offsets_bytes..];
+    try std.testing.expect(bytes.len > 4 + offsets_bytes);
+    const text = bytes[4 + offsets_bytes ..];
     try std.testing.expectEqual(@as(u32, 0), tokenOffset(bytes, 0));
     var id: u32 = 0;
     while (id < token_count) : (id += 1) {
@@ -1429,8 +1568,6 @@ fn convertTiny(
     return run(arena, io, .{
         .input_dir = input,
         .output_dir = output,
-        .input_name = "checkpoint",
-        .output_name = "model",
         .model_id = "tiny-qwen3-asr",
         .quantization = .q4,
         .shard_bytes_max = shard_bytes_max,
@@ -1592,6 +1729,70 @@ test "an output projection that differs from the embedding is stored and untied"
         .output_is_tied = false,
         .layer_ranges = &tiny_layer_ranges,
     });
+}
+
+test "converting without quantization stores matrix weights as f16" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = try tmp.dir.createDirPathOpen(io, "checkpoint", .{
+        .open_options = .{ .iterate = true },
+    });
+    defer input.close(io);
+    var output = try tmp.dir.createDirPathOpen(io, "model", .{});
+    defer output.close(io);
+    try writeTinyCheckpoint(arena, io, input, .{});
+
+    const config = tinyConfig();
+    var diagnostics: Diagnostics = .{};
+    const report = try run(arena, io, .{
+        .input_dir = input,
+        .output_dir = output,
+        .model_id = "tiny-qwen3-asr",
+        .quantization = .f16,
+        .shard_bytes_max = 1 << 20,
+        .verify = true,
+    }, &diagnostics);
+
+    // Every tensor is stored at its element width, so the payload is the
+    // checkpoint's own size and the manifest says so.
+    try std.testing.expect(report.bits_per_weight > 15.9);
+    // Just over 16: the biases and normalization weights stay in f32, so their
+    // share costs two extra bytes an element.
+    try std.testing.expect(report.bits_per_weight < 16.5);
+    const manifest_bytes = try readModelFile(arena, io, output, "manifest.json");
+    const value = try manifest.read(arena, manifest_bytes);
+    try std.testing.expectEqualStrings("f16", value.quantization);
+    // One shard: nothing at 16 bits per weight comes close to the budget.
+    try std.testing.expectEqual(@as(usize, 1), report.shards.len);
+    try std.testing.expectEqual(@as(u32, 0), report.shards[0].first_layer);
+
+    // And a bias vector is still f32: the storage policy is about the tensor's
+    // role, not about the flag.
+    const bytes = try output.readFileAllocOptions(
+        io,
+        report.shards[0].name,
+        arena,
+        .limited(safetensors.checkpoint_bytes_max),
+        .@"16",
+        null,
+    );
+    const file = try container.File.parse(bytes);
+    const required = layout.find(&config, .projector_in_weight, 0).?;
+    try std.testing.expectEqual(
+        @backingInt(required.format(.f16)),
+        file.find(@backingInt(required.kind), 0).?.format,
+    );
+    const norm = layout.find(&config, .decoder_final_norm_weight, 0).?;
+    try std.testing.expectEqual(qwenscriber.dtype.Format.f32, norm.format(.f16));
+    try std.testing.expectEqual(@backingInt(norm.format(.f16)), file.find(
+        @backingInt(norm.kind),
+        0,
+    ).?.format);
 }
 
 test "a checkpoint missing a tensor the runtime needs is rejected by name" {
