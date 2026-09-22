@@ -149,6 +149,64 @@ export async function addPass(
 }
 
 /**
+ * `out[i] = silu(gate[i]) * up[i]`, the decoder's gated feed-forward activation.
+ *
+ * The two operands are separate buffers because the projections are: the core multiplies the halves
+ * of one buffer, and a caller that has them apart passes them apart.
+ */
+export async function siluMulPass(
+  runtime: WebGpuRuntime,
+  gate: GPUBuffer,
+  up: GPUBuffer,
+  count: number,
+  label: string,
+): Promise<{ readonly output: GPUBuffer; readonly geometry: WebGpuDispatchGeometry }> {
+  const output = runtime.createOutputBuffer(count * Float32Array.BYTES_PER_ELEMENT, `${label}.out`);
+  const params = runtime.createUniformBuffer(packUniform([count, 0, 0, 0]), `${label}.params`);
+  const geometry = await runtime.dispatch(
+    "silu_mul",
+    [params, gate, up, output],
+    [Math.ceil(count / 256), 1, 1],
+  );
+  params.destroy();
+  return { output, geometry };
+}
+
+/**
+ * Rotary position embedding for one token.
+ *
+ * The kernel computes its own inverse frequencies from `theta`, so no table crosses the boundary;
+ * `tokens` is one because a decode step embeds one position.
+ */
+export async function ropePass(
+  runtime: WebGpuRuntime,
+  input: GPUBuffer,
+  heads: number,
+  head_dim: number,
+  theta: number,
+  position_base: number,
+  label: string,
+): Promise<{ readonly output: GPUBuffer; readonly geometry: WebGpuDispatchGeometry }> {
+  const output = runtime.createOutputBuffer(
+    heads * head_dim * Float32Array.BYTES_PER_ELEMENT,
+    `${label}.out`,
+  );
+  const params = runtime.createUniformBuffer(
+    // Eight fields because the struct is 32 bytes: the position base follows the f32 theta, and a
+    // uniform block's size has to be a multiple of sixteen.
+    packUniform([1, heads, head_dim, theta, position_base, 0, 0, 0], [3]),
+    `${label}.params`,
+  );
+  const geometry = await runtime.dispatch(
+    "rope",
+    [params, input, output],
+    [Math.max(1, Math.ceil(head_dim / 2 / 64)), heads, 1],
+  );
+  params.destroy();
+  return { output, geometry };
+}
+
+/**
  * Replaces `target` with the sum of it and `addend`, releasing the buffer it replaces.
  *
  * A bind group cannot use one buffer as both a read-only and a writable binding, so a residual moves

@@ -25,6 +25,7 @@ export type WebGpuKernelName =
   | "add_bias_f32"
   | "argmax_f32"
   | "quantize_q8_group"
+  | "decode_attention_q8"
   | "gather_row"
   | "rmsnorm"
   | "rope"
@@ -197,6 +198,23 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
       { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
     ],
   },
+  decode_attention_q8: {
+    name: "decode_attention_q8",
+    file: "decode_attention_q8.wgsl",
+    entryPoint: "decode_attention_q8_main",
+    workgroupSize: [128, 1, 1],
+    // The scores for one window, plus the 128-lane reduction array: 4096 * 4 + 128 * 4 bytes.
+    workgroupStorageBytes: 4096 * 4 + 128 * 4,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES * 2 },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 3, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 4, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 5, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 6, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
   rmsnorm: {
     name: "rmsnorm",
     file: "rmsnorm.wgsl",
@@ -217,7 +235,9 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
     workgroupSize: [64, 1, 1],
     workgroupStorageBytes: 0,
     bindings: [
-      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      // Two param blocks: the fourth field is an f32 and the fifth is the position base, so the
+      // struct pads out to 32 bytes of uniform storage.
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES * 2 },
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
       { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
     ],

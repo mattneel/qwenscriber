@@ -393,6 +393,7 @@ function build_normalization_cases() {
                     uniform: pack_uniform([
                         SHAPE.rope_tokens, SHAPE.rope_heads, SHAPE.head_dim,
                         f32_field(SHAPE.rope_theta),
+                        0, 0, 0, 0,
                     ]),
                 },
                 { input: rope_input },
@@ -405,6 +406,33 @@ function build_normalization_cases() {
             tolerance: TOLERANCES.rope,
             detail: `tokens ${SHAPE.rope_tokens}, heads ${SHAPE.rope_heads}, ` +
                 `head_dim ${SHAPE.head_dim}, theta ${SHAPE.rope_theta}`,
+        },
+        {
+            // The same rotation one batch further along: a decode step embeds a single token at the
+            // position it holds, so the base has to reach the angle. A kernel that ignored it would
+            // pass every case above and embed every generated token at position zero.
+            name: "rope_offset",
+            shader: "rope.wgsl",
+            entry_point: "rope_main",
+            workgroup: [64, 1, 1],
+            bindings: [
+                {
+                    uniform: pack_uniform([
+                        SHAPE.rope_tokens, SHAPE.rope_heads, SHAPE.head_dim,
+                        f32_field(SHAPE.rope_theta),
+                        5, 0, 0, 0,
+                    ]),
+                },
+                { input: rope_input },
+                { output: rope_input.length },
+            ],
+            dispatch: [ceil_div(SHAPE.head_dim / 2, 64), SHAPE.rope_heads, SHAPE.rope_tokens],
+            expected: ref.rope_reference(
+                rope_input, SHAPE.rope_tokens, SHAPE.rope_heads, SHAPE.head_dim, SHAPE.rope_theta, 5,
+            ),
+            tolerance: TOLERANCES.rope,
+            detail: `tokens ${SHAPE.rope_tokens} at positions 5..` +
+                `${4 + SHAPE.rope_tokens}`,
         },
         {
             name: "silu_mul",

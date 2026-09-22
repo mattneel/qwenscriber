@@ -18,8 +18,10 @@
 // head_dim <= ROPE_HEAD_DIM_MAX so a smaller head still runs. The harness only
 // exercises 128.
 //
-// Position is the token index: a batch is one sequence laid out contiguously
-// from position 0.
+// Position is `position_base + the token index`, so a batch is one sequence laid out contiguously
+// and a decode step can embed a single token at the position it actually holds. Without the base a
+// one-token dispatch could only ever embed position zero, which is what a decoder that runs a token
+// at a time would silently do.
 //
 // # Memory layout
 //
@@ -29,7 +31,8 @@
 //
 // # Bind group 0
 //
-//   binding 0  uniform    RopeParams { tokens, heads, head_dim, theta }  (16 bytes)
+//   binding 0  uniform    RopeParams { tokens, heads, head_dim, theta, position_base, reserved_0,
+//                                       reserved_1, reserved_2 }  (32 bytes)
 //   binding 1  read       x
 //   binding 2  read_write out
 //
@@ -47,6 +50,10 @@ struct RopeParams {
     heads: u32,
     head_dim: u32,
     theta: f32,
+    position_base: u32,
+    reserved_0: u32,
+    reserved_1: u32,
+    reserved_2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: RopeParams;
@@ -69,7 +76,7 @@ fn rope_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let position = f32(gid.z);
+    let position = f32(gid.z + params.position_base);
     let inverse_frequency = pow(params.theta, -2.0 * f32(gid.x) / f32(params.head_dim));
     let angle = position * inverse_frequency;
     let cos_angle = cos(angle);

@@ -307,7 +307,7 @@ export function rmsnorm_reference(x, weight, rows, cols, eps) {
 // angle are rounded to f32 before the trigonometry, so the reference makes the
 // same f32 rounding choices the kernel does and the remaining difference is the
 // adapter's own `pow`/`sin`/`cos`.
-export function rope_reference(x, tokens, heads, head_dim, theta) {
+export function rope_reference(x, tokens, heads, head_dim, theta, position_base = 0) {
     const half = head_dim / 2;
     const out = new Float32Array(tokens * heads * head_dim);
     for (let token = 0; token < tokens; token += 1) {
@@ -315,7 +315,7 @@ export function rope_reference(x, tokens, heads, head_dim, theta) {
             const base = (token * heads + head) * head_dim;
             for (let pair = 0; pair < half; pair += 1) {
                 const inverse_frequency = f32(Math.pow(theta, (-2 * pair) / head_dim));
-                const angle = f32(f32(token) * inverse_frequency);
+                const angle = f32(f32(token + position_base) * inverse_frequency);
                 const cos_angle = f32(Math.cos(angle));
                 const sin_angle = f32(Math.sin(angle));
                 const first = x[base + pair];

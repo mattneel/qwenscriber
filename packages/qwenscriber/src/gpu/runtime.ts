@@ -291,6 +291,33 @@ export class WebGpuRuntime {
     return buffer;
   }
 
+  /**
+   * Reads `elementCount` u32 values back from a buffer that has `COPY_SRC`.
+   *
+   * Separate from `readFloats` because an index read as f32 is a denormal: the argmax kernel answers
+   * with a token id, and reinterpreting four bytes as a float would compare noise.
+   */
+  async readWords(
+    buffer: GPUBuffer,
+    elementCount: number,
+    offsetBytes = 0,
+  ): Promise<Uint32Array> {
+    this.#throwIfLost("gpu.read");
+    const byte_length = elementCount * 4;
+    const staging = this.#device.createBuffer({
+      size: alignTo4(byte_length),
+      usage: BUFFER_USAGE.COPY_DST | BUFFER_USAGE.MAP_READ,
+    });
+    const encoder = this.#device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, offsetBytes, staging, 0, byte_length);
+    this.#device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(MAP_MODE.READ);
+    const values = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return values;
+  }
+
   /** Reads `elementCount` f32 values back from a buffer that has `COPY_SRC`. */
   async readFloats(
     buffer: GPUBuffer,

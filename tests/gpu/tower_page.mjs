@@ -394,6 +394,126 @@ export async function run() {
         mean_abs: blocks.mean_abs,
         failures: blocks.failures,
     });
-    const ok = comparison.failures === 0 && blocks_relative.relative <= 2e-2;
+    // The decoder, over the prompt the host used, with the host's own projector output spliced in
+    // where the audio placeholder tokens sit. Feeding the dump's `audio_projected` rather than the
+    // tower's output is deliberate: it isolates the decoder from the tower, which the comparisons
+    // above already cover.
+    // The logits come from a dump of a *q8-cache* run, which is what this decoder drives: the cache
+    // format changes what the attention reads, so the oracle has to have been produced with it. The
+    // prompt and the projector output are the same stages as the other dump's.
+    const DECODER_FIXTURE_URL = "/models/qwen3-asr-0.6b-q5/dump-q8/";
+    const prompt = await load_fixture(`${DECODER_FIXTURE_URL}decoder_input_ids.f32`);
+    const projected = await load_fixture(`${DECODER_FIXTURE_URL}audio_projected.f32`);
+    const expected_logits = await load_fixture(`${DECODER_FIXTURE_URL}logits_step0.f32`);
+    const generated = await load_fixture(`${DECODER_FIXTURE_URL}generated_ids.f32`);
+
+    // The prompt spells the audio as `steps` copies of the pad token, so the placeholder is the run
+    // of equal ids whose length is the audio's step count. Requiring the run to have exactly that
+    // length keeps this from feeding ordinary tokens as audio if the prompt layout ever changes.
+    const ids = Array.from(prompt.values);
+    const audio_steps = projected.dims[0];
+    let placeholder_at = -1;
+    for (let start = 0; start + audio_steps <= ids.length && placeholder_at < 0; start += 1) {
+        let run = 0;
+        while (start + run < ids.length && ids[start + run] === ids[start]) run += 1;
+        if (run === audio_steps) placeholder_at = start;
+    }
+    notes.push(
+        `decoder: prompt ${ids.length} tokens, ${audio_steps} audio rows, placeholder ` +
+            `${placeholder_at >= 0 ? `at ${placeholder_at}` : "not found"}`,
+    );
+
+    const decoder_weights = uploadTextDecoderWeights(runtime, model);
+    const decoder_shape = decoder_weights.geometry;
+    const cache = allocateDecoderCache(runtime, decoder_shape, positions);
+    notes.push(
+        `decoder shape: hidden ${decoder_shape.hidden}, heads ${decoder_shape.heads}, kv ` +
+            `${decoder_shape.kv_heads} x ${decoder_shape.head_dim}, ffn ${decoder_shape.ffn_dim}, ` +
+            `vocab ${decoder_shape.vocab}, ${decoder_shape.layers} layers`,
+    );
+
+    const settings = { eps: 1e-6, rope_theta: 1000000.0 };
+    const decoder_started = performance.now();
+    let audio_row = 0;
+    let decoder_dispatches = 0;
+    let logits_buffer = null;
+    for (let index = 0; index < ids.length; index += 1) {
+        const is_audio = placeholder_at >= 0 && index >= placeholder_at &&
+            index < placeholder_at + audio_steps;
+        const want_logits = index === ids.length - 1;
+        if (is_audio && audio_row >= audio_steps) {
+            throw new Error(`ran out of audio rows at prompt token ${index}`);
+        }
+        if (is_audio) {
+            const hidden = runtime.uploadBytes(
+                new Uint8Array(
+                    projected.values.buffer,
+                    projected.values.byteOffset + audio_row * decoder_shape.hidden * 4,
+                    decoder_shape.hidden * 4,
+                ),
+                `decoder.audio.${audio_row}`,
+            );
+            const stepped = await decodeToken(
+                runtime, decoder_weights.weights, decoder_shape, cache, { hidden },
+                { ...settings, want_logits },
+            );
+            decoder_dispatches += stepped.dispatches.length;
+            if (stepped.logits !== undefined) logits_buffer = stepped.logits;
+            audio_row += 1;
+        } else {
+            const stepped = await decodeToken(
+                runtime, decoder_weights.weights, decoder_shape, cache, { token: ids[index] },
+                { ...settings, want_logits },
+            );
+            decoder_dispatches += stepped.dispatches.length;
+            if (stepped.logits !== undefined) logits_buffer = stepped.logits;
+        }
+    }
+    const decoder_ms = performance.now() - decoder_started;
+    notes.push(
+        `decoder: ${decoder_dispatches} dispatches for ${ids.length} tokens in ` +
+            `${decoder_ms.toFixed(0)} ms (${(ids.length / (decoder_ms / 1000)).toFixed(2)} tokens/s)`,
+    );
+
+    let decoder_failures = 0;
+    let decoder_max = 0;
+    if (logits_buffer === null) {
+        decoder_failures = 1;
+        notes.push("decoder: no logits were produced");
+    } else {
+        const logits = await runtime.readFloats(logits_buffer, decoder_shape.vocab);
+        logits_buffer.destroy();
+        const logits_comparison = scaleRelative(logits, expected_logits.values);
+        decoder_failures = logits_comparison.relative <= 2e-2 ? 0 : 1;
+        decoder_max = logits_comparison.worst;
+        notes.push(
+            `decoder logits: max|d| ${logits_comparison.worst.toExponential(3)} over scale ` +
+                `${logits_comparison.scale.toExponential(3)} = ` +
+                `${logits_comparison.relative.toExponential(2)}`,
+        );
+        let best = 0;
+        for (let index = 1; index < logits.length; index += 1) {
+            if (logits[index] > logits[best]) best = index;
+        }
+        const expected_token = generated.values.length > 0
+            ? Array.from(generated.values)[0]
+            : undefined;
+        notes.push(
+            `decoder argmax: ${best}${expected_token === undefined
+                ? " (the dump produced no token)"
+                : `, the host produced ${expected_token}`}`,
+        );
+        if (expected_token !== undefined && best !== expected_token) decoder_failures = 1;
+    }
+    rows.push({
+        name: "text decoder",
+        status: decoder_failures === 0 ? "pass" : "fail",
+        elements: expected_logits.values.length,
+        max_abs: decoder_max,
+        mean_abs: 0,
+        failures: decoder_failures,
+    });
+
+    const ok = comparison.failures === 0 && blocks_relative.relative <= 2e-2 && decoder_failures === 0;
     return { adapter: info, limits, rows, notes, ok };
 }
