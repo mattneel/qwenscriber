@@ -92,6 +92,8 @@ export const TOLERANCES = {
     matmul_f16: { atol: 1e-3, rtol: 1e-4 },
     // A permutation of the same values: expected bit exact.
     transpose: { atol: 0, rtol: 0 },
+    // One addition per element: expected bit exact.
+    add: { atol: 0, rtol: 0 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -264,6 +266,8 @@ function build_normalization_cases() {
     const transpose_rows = 480;
     const transpose_cols = 13;
     const transpose_input = ref.random_vector(transpose_rows * transpose_cols, 0x5eed_000f);
+    const add_left = ref.random_vector(SHAPE.silu_count, 0x5eed_0010);
+    const add_right = ref.random_vector(SHAPE.silu_count, 0x5eed_0011);
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
     const up = ref.random_vector(SHAPE.silu_count, 0x5eed_0007);
     const gelu_input = ref.random_vector(SHAPE.gelu_count, 0x5eed_0008);
@@ -394,6 +398,22 @@ function build_normalization_cases() {
             tolerance: TOLERANCES.layernorm,
             detail: `rows ${SHAPE.layernorm_rows}, cols ${SHAPE.layernorm_cols}, ` +
                 `eps ${SHAPE.layernorm_eps}`,
+        },
+        {
+            name: "add_f32",
+            shader: "add_f32.wgsl",
+            entry_point: "add_f32_main",
+            workgroup: [256, 1, 1],
+            bindings: [
+                { uniform: pack_uniform([SHAPE.silu_count, 0, 0, 0]) },
+                { input: add_left },
+                { input: add_right },
+                { output: SHAPE.silu_count },
+            ],
+            dispatch: [ceil_div(SHAPE.silu_count, 256), 1, 1],
+            expected: Float32Array.from(add_left, (value, index) => value + add_right[index]),
+            tolerance: TOLERANCES.add,
+            detail: `count ${SHAPE.silu_count}`,
         },
         {
             name: "transpose_f32",
