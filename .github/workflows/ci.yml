@@ -25,8 +25,16 @@ concurrency:
 
 jobs:
   zig:
-    name: Zig core, WASM module, and ABI self-test
+    # Debug is where assertions fire; ReleaseSafe keeps the safety checks with
+    # optimizations on; ReleaseFast is what ships. The three do not find the same
+    # bugs — an uninitialized read can pass in one and trap in another — so the
+    # gate runs all of them rather than trusting the cheapest configuration.
+    name: Zig gate (${{ matrix.optimize }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,7 +49,7 @@ jobs:
       - name: Report toolchain
         run: zig version
       - name: Format check, unit tests, reference comparisons, WASM ABI
-        run: zig build check
+        run: zig build check -Doptimize=${{ matrix.optimize }}
       - name: Build the freestanding module
         run: zig build wasm
 
