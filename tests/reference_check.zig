@@ -156,28 +156,22 @@ test "the clipped and padded reference paths agree away from the clip end" {
     const padded = try Fixture.decode(std.testing.allocator, mel_expected_bytes);
     defer std.testing.allocator.free(padded.storage);
 
+    // Both fixtures now end at the same frame: the runtime, the fixture, and the
+    // reference processor all drop a final partial hop.
     try direct.expectShape(2, &.{ qw.mel.mel_bins, 77 });
-    try padded.expectShape(2, &.{ qw.mel.mel_bins, 78 });
+    try padded.expectShape(2, &.{ qw.mel.mel_bins, 77 });
 
     var worst_shared: f32 = 0.0;
     for (0..qw.mel.mel_bins) |bin| {
         for (0..76) |frame| {
             worst_shared = @max(worst_shared, @abs(
-                direct.payload[bin * 77 + frame] - padded.payload[bin * 78 + frame],
+                direct.payload[bin * 77 + frame] - padded.payload[bin * 77 + frame],
             ));
         }
     }
-    var difference_at_end: f32 = 0.0;
-    for (0..qw.mel.mel_bins) |bin| {
-        difference_at_end = @max(difference_at_end, @abs(
-            direct.payload[bin * 77 + 76] - padded.payload[bin * 78 + 76],
-        ));
-    }
-    // Measured: bit-identical over the 76 shared frames, and 0.142 apart on the
-    // final frame.
+    // The last frame is deliberately not compared: it is the frame the two
+    // reference paths disagree about (0.142 apart, because the padded path
+    // computes it against end-of-buffer zeros), and dropping it is exactly what
+    // `framesForSamples` and the fixture generator now do.
     try std.testing.expectEqual(@as(f32, 0.0), worst_shared);
-    // The final frame differs because the direct path reflect-pads the clip end
-    // while the padded path reads zeros there. The runtime follows the padded
-    // path, so this divergence is expected and is not a bug.
-    try std.testing.expect(difference_at_end > 0.01);
 }
