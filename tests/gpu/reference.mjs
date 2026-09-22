@@ -416,13 +416,72 @@ export function erf_reference(value) {
 }
 
 // `gelu` from src/core/math.zig: the exact (error-function) form, as torch's default computes it.
+export function gelu_value(value) {
+    return f32(f32(0.5 * value) * (1 + erf_reference(f32(value * 0.70710678))));
+}
+
 export function gelu_reference(x, count) {
     const out = new Float32Array(count);
-    for (let index = 0; index < count; index += 1) {
-        const value = x[index];
-        out[index] = f32(f32(0.5 * value) * (1 + erf_reference(f32(value * 0.70710678))));
+    for (let index = 0; index < count; index += 1) out[index] = gelu_value(x[index]);
+    return out;
+}
+
+// Weight `index` of a packed f16 plane: the low half of element `index / 2` when `index` is even,
+// the high half otherwise, which is how the container stores a u16 tensor.
+function packed_f16_bits(packed_weights, index) {
+    const element = packed_weights[index >> 1];
+    return (element >>> ((index & 1) * 16)) & 0xffff;
+}
+
+// `conv3x3Stride2Gelu` from src/core/qwen3_asr/kernels.zig.
+//
+// The bias first, then each input channel's nine taps in row-major kernel order, then one GELU over
+// the finished sum -- not one per channel. Padding is one, stride is two, so the output plane is
+// `(in_height - 1) / 2 + 1` by `(in_width - 1) / 2 + 1`.
+export function conv3x3_stride2_gelu_reference(
+    input, packed_weights, bias, out_channels, in_channels, in_height, in_width,
+) {
+    const out_height = Math.floor((in_height - 1) / 2) + 1;
+    const out_width = Math.floor((in_width - 1) / 2) + 1;
+    const in_plane = in_height * in_width;
+    const out_plane = out_height * out_width;
+    const out = new Float32Array(out_channels * out_plane);
+    for (let channel = 0; channel < out_channels; channel += 1) {
+        for (let out_row = 0; out_row < out_height; out_row += 1) {
+            for (let out_column = 0; out_column < out_width; out_column += 1) {
+                let sum = bias[channel];
+                for (let in_channel = 0; in_channel < in_channels; in_channel += 1) {
+                    const weight_base = (channel * in_channels + in_channel) * 9;
+                    for (let kernel_row = 0; kernel_row < 3; kernel_row += 1) {
+                        const in_row = out_row * 2 + kernel_row - 1;
+                        if (in_row < 0 || in_row >= in_height) continue;
+                        for (let kernel_column = 0; kernel_column < 3; kernel_column += 1) {
+                            const in_column = out_column * 2 + kernel_column - 1;
+                            if (in_column < 0 || in_column >= in_width) continue;
+                            const sample =
+                                input[in_channel * in_plane + in_row * in_width + in_column];
+                            const bits = packed_f16_bits(
+                                packed_weights, weight_base + kernel_row * 3 + kernel_column,
+                            );
+                            sum += from_f16_bits(bits) * sample;
+                        }
+                    }
+                }
+                out[channel * out_plane + out_row * out_width + out_column] = gelu_value(f32(sum));
+            }
+        }
     }
     return out;
+}
+
+// Packs f32 weights into the u16-pair layout `conv3x3_stride2_gelu_reference` and the shader read,
+// through the same f16 rounding the container's writer uses.
+export function pack_f16_pairs(weights) {
+    const packed = new Uint32Array(Math.ceil(weights.length / 2));
+    for (let index = 0; index < weights.length; index += 1) {
+        packed[index >> 1] |= to_f16_bits(weights[index]) << ((index & 1) * 16);
+    }
+    return packed;
 }
 
 // `layerNormInPlace` from src/core/math.zig.

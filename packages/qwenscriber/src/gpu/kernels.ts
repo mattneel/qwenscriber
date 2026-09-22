@@ -25,6 +25,7 @@ export type WebGpuKernelName =
   | "silu_mul"
   | "gelu"
   | "layernorm"
+  | "conv3x3_stride2_gelu"
   | "dequant_reference";
 
 /** What a shader declares at `@group(0) @binding(n)`. */
@@ -170,6 +171,23 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
     entryPoint: "layernorm_main",
     workgroupSize: [256, 1, 1],
     workgroupStorageBytes: 256 * 4,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 3, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 4, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  conv3x3_stride2_gelu: {
+    name: "conv3x3_stride2_gelu",
+    file: "conv3x3_stride2_gelu.wgsl",
+    entryPoint: "conv3x3_stride2_gelu_main",
+    workgroupSize: [256, 1, 1],
+    // The decoded 3x3 weights for one output channel: 512 input channels * 9 taps * 4 bytes. This
+    // is the number that makes the kernel need a device limit above the specification's 16384-byte
+    // default, which `WebGpuRuntime.create` asks the adapter for when a caller declares it.
+    workgroupStorageBytes: 512 * 9 * 4,
     bindings: [
       { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },

@@ -161,9 +161,28 @@ export class WebGpuRuntime {
     }
 
     const adapter = acquisition.adapter as GPUAdapter;
+    // A device starts at the specification's defaults, not at the adapter's capability, and some
+    // kernels need the raised ones: workgroup storage stays at 16384 bytes unless the request asks
+    // for more, while the convolution kernel stages 18432 bytes of decoded 3x3 weights. Only `max`
+    // limits are requested. They are the ones an adapter can hand over; a `min` limit requested
+    // below what the adapter reports is an invalid request rather than a stricter device.
+    // `requireLimits` above has already reported any shortfall, so this request is the declared
+    // value clamped to what the adapter offers.
+    const declared = (options.requiredLimits ?? {}) as unknown as Record<string, number | undefined>;
+    const reported = limits as unknown as Record<string, number | undefined>;
+    const required: Record<string, number> = {};
+    for (const [name, value] of Object.entries(declared)) {
+      const available = reported[name];
+      if (name.startsWith("max") && typeof value === "number" && typeof available === "number") {
+        required[name] = Math.min(value, available);
+      }
+    }
+
     let device: GPUDevice;
     try {
-      device = await adapter.requestDevice();
+      device = await adapter.requestDevice(
+        Object.keys(required).length === 0 ? {} : { requiredLimits: required },
+      );
     } catch (error) {
       throw new GpuUnavailableError(
         "gpu.create",

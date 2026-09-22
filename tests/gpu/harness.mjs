@@ -84,6 +84,9 @@ export const TOLERANCES = {
     // Same shape of reduction as rmsnorm, one more pass for the mean: accumulating 256 f32 values
     // per step in a different order from the reference is where the difference comes from.
     layernorm: { atol: 1e-4, rtol: 1e-4 },
+    // The accumulation order matches the reference tap for tap and the f16 decode is exact, so the
+    // bound is GELU's `exp` plus the adapter's arithmetic.
+    conv3x3: { atol: 1e-4, rtol: 1e-4 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -116,6 +119,13 @@ const SHAPE = {
     layernorm_rows: 32,
     layernorm_cols: 256,
     layernorm_eps: 1e-5,
+    // Odd channel counts on purpose: nine weights per input channel put every second channel's
+    // block at an odd offset in the packed f16 plane, which is where a base-relative half index
+    // goes wrong.
+    conv_out_channels: 5,
+    conv_in_channels: 3,
+    conv_in_height: 8,
+    conv_in_width: 8,
 };
 
 // ---------------------------------------------------------------------------
@@ -230,6 +240,18 @@ function build_normalization_cases() {
     );
     const layernorm_weight = ref.random_vector(SHAPE.layernorm_cols, 0x5eed_000a);
     const layernorm_bias = ref.random_vector(SHAPE.layernorm_cols, 0x5eed_000b);
+    const conv_input = ref.random_vector(
+        SHAPE.conv_in_channels * SHAPE.conv_in_height * SHAPE.conv_in_width,
+        0x5eed_000c,
+    );
+    const conv_weights = ref.pack_f16_pairs(ref.random_vector(
+        SHAPE.conv_out_channels * SHAPE.conv_in_channels * 9,
+        0x5eed_000d,
+        // Small weights: nine taps times three channels of unit-scale input would otherwise leave
+        // GELU's saturated tails, where every implementation agrees and nothing is being tested.
+        ref.random_uniform,
+    ));
+    const conv_bias = ref.random_vector(SHAPE.conv_out_channels, 0x5eed_000e);
 
     return [
         {
@@ -339,6 +361,53 @@ function build_normalization_cases() {
             tolerance: TOLERANCES.layernorm,
             detail: `rows ${SHAPE.layernorm_rows}, cols ${SHAPE.layernorm_cols}, ` +
                 `eps ${SHAPE.layernorm_eps}`,
+        },
+        {
+            name: "conv3x3_stride2_gelu",
+            shader: "conv3x3_stride2_gelu.wgsl",
+            entry_point: "conv3x3_stride2_gelu_main",
+            workgroup: [256, 1, 1],
+            bindings: [
+                {
+                    uniform: pack_uniform([
+                        SHAPE.conv_out_channels,
+                        SHAPE.conv_in_channels,
+                        SHAPE.conv_in_height,
+                        SHAPE.conv_in_width,
+                    ]),
+                },
+                { input: conv_input },
+                { input: conv_weights },
+                { input: conv_bias },
+                {
+                    output: SHAPE.conv_out_channels *
+                        (Math.floor((SHAPE.conv_in_height - 1) / 2) + 1) *
+                        (Math.floor((SHAPE.conv_in_width - 1) / 2) + 1),
+                },
+            ],
+            dispatch: [
+                ceil_div(
+                    (Math.floor((SHAPE.conv_in_height - 1) / 2) + 1) *
+                        (Math.floor((SHAPE.conv_in_width - 1) / 2) + 1),
+                    256,
+                ),
+                SHAPE.conv_out_channels,
+                1,
+            ],
+            expected: ref.conv3x3_stride2_gelu_reference(
+                conv_input,
+                conv_weights,
+                conv_bias,
+                SHAPE.conv_out_channels,
+                SHAPE.conv_in_channels,
+                SHAPE.conv_in_height,
+                SHAPE.conv_in_width,
+            ),
+            tolerance: TOLERANCES.conv3x3,
+            detail: `out ${SHAPE.conv_out_channels}, in ${SHAPE.conv_in_channels}, ` +
+                `${SHAPE.conv_in_height}x${SHAPE.conv_in_width} -> ` +
+                `${Math.floor((SHAPE.conv_in_height - 1) / 2) + 1}x` +
+                `${Math.floor((SHAPE.conv_in_width - 1) / 2) + 1}, stride 2, pad 1`,
         },
     ];
 }
@@ -512,7 +581,15 @@ async function create_device() {
         throw new Error("navigator.gpu is unavailable: this browser has no WebGPU");
     }
     const adapter = await request_adapter();
-    const device = await adapter.requestDevice();
+    // The device starts at the specification's defaults, which cap workgroup storage at 16384
+    // bytes; the convolution kernel stages 18432 for its decoded weights and this host's adapter
+    // offers 32768. The harness asks for the adapter's own maximum, which is what a runtime has to
+    // do for a kernel like that to be creatable at all.
+    const device = await adapter.requestDevice({
+        requiredLimits: {
+            maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+        },
+    });
     const info = adapter.info ?? {};
     const limits = {};
     for (const name of [
@@ -670,7 +747,11 @@ export async function run_case(gpu, kernel_case, keep_values = false) {
 
     if (internal_error !== null || validation_error !== null) {
         row.status = "error";
-        row.message = String(internal_error ?? validation_error);
+        // Name the scope and prefer the message: a WebGPU error object stringifies to
+        // "[object GPUValidationError]" and hides the one useful line.
+        const scope = internal_error !== null ? "internal" : "validation";
+        const error = internal_error ?? validation_error;
+        row.message = `${scope} error: ${error?.message ?? String(error)}`;
         return row;
     }
     if (actual.length !== kernel_case.expected.length) {
@@ -863,7 +944,7 @@ export async function run_harness() {
                 status: "error",
                 tolerance: kernel_case.tolerance,
                 detail: kernel_case.detail,
-                message: String(error),
+                message: error?.message ? String(error.message) : String(error),
             };
         }
         if (row.status === "error") {
