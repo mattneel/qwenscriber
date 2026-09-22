@@ -1,19 +1,72 @@
 # Model conversion
 
-Official Qwen3-ASR checkpoints must be converted into Qwenscriber's versioned, sharded distribution
-format before browser use.
-
-## Intended command
+Official Qwen3-ASR checkpoints are converted into Qwenscriber's versioned, sharded distribution
+format by `qwenscriber-convert`, a native Zig tool that `zig build` installs next to the runtime:
 
 ```sh
-qwenscriber-convert \
-  --input Qwen3-ASR-0.6B \
-  --output model/ \
-  --quant q4
+zig build
+zig-out/bin/qwenscriber-convert \
+  --input models/Qwen3-ASR-0.6B \
+  --output models/qwen3-asr-0.6b-q5 \
+  --quant q5 \
+  --verify
 ```
 
-The command and flags are planned until the converter is released. Production conversion should
-trend toward a Zig tool that can ship as a self-contained native binary.
+| Flag | Meaning |
+| --- | --- |
+| `--input <dir>` | Upstream checkpoint directory: `config.json`, the tokenizer files, and one or more `*.safetensors` |
+| `--output <dir>` | Model directory to create or overwrite |
+| `--quant q4\|q5\|q8\|none` | Weight format; `none` writes f16, which is what reference runs use |
+| `--shard-bytes <n>` | Shard budget in bytes (default 192 MiB) |
+| `--max-positions <n>` | Decoder positions to allocate the key/value cache for (default 8192) |
+| `--model-id <name>` | Identifier recorded in the manifest (default: the input directory's name) |
+| `--verify` | Re-read every shard and compare it against the checkpoint |
+
+The converter walks the core's own tensor inventory (`src/core/qwen3_asr/layout.zig`), so a tensor the
+runtime asks for but the checkpoint lacks, or one the checkpoint has that the configuration does not
+describe, stops the conversion instead of producing a model that fails at load time.
+
+## Quantization policy
+
+Measured on `tests/fixtures/audio/asr_zh.wav`, which the reference pipeline transcribes as
+「甚至出现交易几乎停滞的情况。」. Sizes are exact; the outcome column is the transcript of the same clip
+through the same runtime:
+
+| Format | Payload | Bits/weight | Reference transcript |
+| --- | --- | --- | --- |
+| q4 | 422.7 MB | 4.32 | **none** — the run produces no tokens |
+| q5 | 520.0 MB | 5.32 | yes |
+| q8 | 811.7 MB | 8.30 | yes |
+| f16 | 1565.4 MB | 16.01 | yes |
+
+The same clip and the same user prompt through 1.7B, converted the same way:
+
+| Format | Payload | Bits/weight | Reference transcript |
+| --- | --- | --- | --- |
+| q5 | 1344.6 MB | 5.28 | yes |
+| f16 | 4077.0 MB | 16.00 | yes |
+
+"Reference transcript" means the sentence the released implementation produces for this clip, read
+through the `-hf` checkpoint upstream publishes for each size. Compare against those repositories and
+not the raw ones: the raw checkpoint is the converter's *input*, and its tensor names and nested
+configuration are pre-conversion.
+
+q4 does not fail by producing garbage. It fails by losing a near-tie: the first decision on this clip
+separates two candidate tokens by 0.095 logits, while q4's mean first-step logit error is about 3.6.
+One wrong first token is not a slightly worse transcript, it is no transcript, because generation
+never recovers. That is why **q5 is the format the browser targets** and q4 is not offered until a
+4-bit scheme with more headroom per group — a zero point, a smaller group, or selective precision on
+the audio tower — has been measured rather than assumed.
+
+Quantization is not a speed compromise here either. On this host, ReleaseFast, f16 measured *slower*
+than both q5 and q8 on the same clip: the decoder is bandwidth-bound, so three times the weight bytes
+costs more than the unpacking arithmetic saves. Per-run numbers are in the metrics records described
+in [Performance](../development/performance.md).
+
+The key/value cache is the other half of the memory budget, and it is not quantized yet: 8192
+positions cost 1.79 GiB in f32 for both 0.6B and 1.7B, since their text configurations share the same
+layer count, head counts, and head width. That cache, not the weights, is what keeps a 1.7B model out
+of a browser's linear memory today — see [Project status](../status.md).
 
 ## Conversion stages
 
