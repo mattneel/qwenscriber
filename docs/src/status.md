@@ -96,10 +96,11 @@ GPU adapter; it is not part of the default command set.
 ## Not yet true
 
 - No release, package, or artifact has been published.
-- CI has run once on `main`. The Zig gate, shader drift gate, and TypeScript SDK jobs passed; the
-  Documentation job failed on an mdBook config field that mdBook 0.5 removed, which is fixed. The book
-  is now published to GitHub Pages from `main`, which requires the repository's Pages source to be set
-  to "GitHub Actions" once.
+- CI's Zig gate installed `version: master` while `build.zig.zon` pins
+  `0.17.0-dev.2251+1175a3e99`; by 2026-09-21 master had moved to `0.17.0-dev.2264+230c63650`, so the
+  gate ran a compiler the code was never written against and failed its first step. It now takes the
+  revision from `build.zig.zon`, which is what the pin is for. The TypeScript SDK job failed on the
+  end-to-end test described below and passes locally now that it is corrected.
 - No performance number on this page has been measured under the benchmark hooks described in the
   architecture pages.
 

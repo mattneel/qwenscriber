@@ -42,10 +42,10 @@ jobs:
           # keeps the job fast and the artifact deterministic.
           fetch-depth: 1
       - uses: mlugg/setup-zig@v2
-        with:
-          # The repository tracks Zig master and pins the revision it was
-          # written against in build.zig.zon.
-          version: master
+        # No `version`: the action installs `minimum_zig_version` from build.zig.zon, the revision
+        # this code was written against. Following `master` instead hands the format check and the
+        # standard library whatever was released overnight, so the gate fails on a compiler nobody
+        # chose -- which is what happened once master moved thirteen revisions past the pin.
       - name: Report toolchain
         run: zig version
       - name: Format check, unit tests, reference comparisons, WASM ABI
@@ -77,8 +77,7 @@ jobs:
         with:
           node-version: "24"
       - uses: mlugg/setup-zig@v2
-        with:
-          version: master
+        # As in the Zig gate: the revision comes from build.zig.zon, not from `master`.
       - name: Build the WASM module the package embeds
         run: zig build wasm
       - name: Build, typecheck, and test
