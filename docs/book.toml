@@ -3,7 +3,6 @@ title = "Qwenscriber"
 description = "Local-first Qwen3-ASR inference with Zig, WebAssembly SIMD, WebGPU/WGSL, and TypeScript"
 authors = ["Qwenscriber contributors"]
 language = "en"
-multilingual = false
 src = "src"
 
 [build]
