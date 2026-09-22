@@ -29,17 +29,20 @@
 import { QwenscriberError, SDK_STATUS } from "../errors.ts";
 import { STATUS, type AudioConfig } from "../wasm/abi.ts";
 import type { WasmModel } from "../decode.ts";
-import { dataPlaneOffsetBytes, quantFormatOf, type QuantFormat } from "./quant_layout.ts";
+import { dataPlaneOffsetBytes, quantFormatOf } from "./quant_layout.ts";
+import {
+  layerNormPass,
+  matmulPass,
+  packUniform,
+  residualPass,
+  type MatrixWeights,
+} from "./passes.ts";
 import { AUDIO_LAYER_BASE, TENSOR_KIND } from "./tensor_kind.ts";
 import type { WebGpuRuntime, WebGpuDispatchGeometry } from "./runtime.ts";
 
 /** A projection weight and its bias: `x * weight + bias`, with the shape the descriptor reports. */
-export interface ProjectionWeights {
-  readonly weight: GPUBuffer;
+export interface ProjectionWeights extends MatrixWeights {
   readonly bias: GPUBuffer;
-  readonly rows: number;
-  readonly cols: number;
-  readonly quant?: { readonly format: QuantFormat; readonly dataOffsetBytes: number } | undefined;
 }
 
 /** One layer's weights, all fourteen of them. */
@@ -169,86 +172,9 @@ export function uploadAudioTowerWeights(
   };
 }
 
-/** A uniform block: u32 fields, with `floats` naming the indices that carry an f32 instead. */
-function packUniform(fields: readonly number[], floats: readonly number[] = []): Uint8Array {
-  const bytes = new Uint8Array(fields.length * 4);
-  const view = new DataView(bytes.buffer);
-  fields.forEach((value, index) => {
-    if (floats.includes(index)) view.setFloat32(index * 4, value, true);
-    else view.setUint32(index * 4, value, true);
-  });
-  return bytes;
-}
-
 // ---------------------------------------------------------------------------
 // The passes
 // ---------------------------------------------------------------------------
-
-async function layerNormPass(
-  runtime: WebGpuRuntime,
-  norm: { readonly weight: GPUBuffer; readonly bias: GPUBuffer },
-  input: GPUBuffer,
-  rows: number,
-  cols: number,
-  eps: number,
-  label: string,
-): Promise<{ readonly output: GPUBuffer; readonly geometry: WebGpuDispatchGeometry }> {
-  const output = runtime.createOutputBuffer(rows * cols * Float32Array.BYTES_PER_ELEMENT, `${label}.out`);
-  const params = runtime.createUniformBuffer(packUniform([rows, cols, eps, 0], [2]), `${label}.params`);
-  const geometry = await runtime.dispatch(
-    "layernorm",
-    [params, input, norm.weight, norm.bias, output],
-    [rows, 1, 1],
-  );
-  params.destroy();
-  return { output, geometry };
-}
-
-/**
- * `x * weight + bias` for one projection.
- *
- * The kernel follows the weight's format, and the bias is a separate pass: the matmul kernels
- * compute the product alone, so that their accumulation is the only thing a comparison has to
- * explain.
- */
-async function projectionPass(
-  runtime: WebGpuRuntime,
-  projection_weights: ProjectionWeights,
-  input: GPUBuffer,
-  tokens: number,
-  label: string,
-): Promise<{ readonly output: GPUBuffer; readonly geometry: readonly WebGpuDispatchGeometry[] }> {
-  const { rows, cols, quant } = projection_weights;
-  if (tokens < 1 || rows < 1 || cols < 1) {
-    throw new QwenscriberError(STATUS.shape_mismatch, "audio_tower", {
-      message: `${label}: a projection needs positive tokens, rows, and cols, got ${tokens}, ${rows}, ${cols}`,
-      context: { tokens, rows, cols },
-    });
-  }
-  const output = runtime.createOutputBuffer(
-    tokens * rows * Float32Array.BYTES_PER_ELEMENT,
-    `${label}.out`,
-  );
-  const params = runtime.createUniformBuffer(
-    packUniform([tokens, rows, cols, quant?.dataOffsetBytes ?? 0]),
-    `${label}.params`,
-  );
-  const product = await runtime.dispatch(
-    quant === undefined ? "matmul_f16" : "matmul_q5",
-    [params, input, projection_weights.weight, output],
-    [Math.ceil(rows / 16), Math.ceil(tokens / 16), 1],
-  );
-  params.destroy();
-
-  const bias_params = runtime.createUniformBuffer(packUniform([tokens, rows, 0, 0]), `${label}.bias`);
-  const biased = await runtime.dispatch(
-    "add_bias_f32",
-    [bias_params, projection_weights.bias, output],
-    [Math.ceil((tokens * rows) / 256), 1, 1],
-  );
-  bias_params.destroy();
-  return { output, geometry: [product, biased] };
-}
 
 /** `out[i] = gelu(x[i])`, into a buffer of its own: a bind group cannot read and write one buffer. */
 async function geluPass(
@@ -266,44 +192,6 @@ async function geluPass(
   );
   params.destroy();
   return { output, geometry };
-}
-
-/**
- * `left[i] + right[i]`, into a buffer of its own.
- *
- * The sum cannot be written back over an operand: a bind group cannot use one buffer as both a
- * read-only and a writable binding, which is why the residual swaps to a fresh buffer and releases
- * the one it replaces. The core's `addInPlace` mutates because linear memory has no such rule.
- */
-async function addPass(
-  runtime: WebGpuRuntime,
-  left: GPUBuffer,
-  right: GPUBuffer,
-  count: number,
-  label: string,
-): Promise<{ readonly output: GPUBuffer; readonly geometry: WebGpuDispatchGeometry }> {
-  const output = runtime.createOutputBuffer(count * Float32Array.BYTES_PER_ELEMENT, `${label}.out`);
-  const params = runtime.createUniformBuffer(packUniform([count, 0, 0, 0]), `${label}.params`);
-  const geometry = await runtime.dispatch(
-    "add_f32",
-    [params, left, right, output],
-    [Math.ceil(count / 256), 1, 1],
-  );
-  params.destroy();
-  return { output, geometry };
-}
-
-/** Replaces `target` with the sum, releasing the buffer it replaces. */
-async function residual(
-  runtime: WebGpuRuntime,
-  target: GPUBuffer,
-  addend: GPUBuffer,
-  count: number,
-  label: string,
-): Promise<{ readonly output: GPUBuffer; readonly geometry: WebGpuDispatchGeometry }> {
-  const sum = await addPass(runtime, target, addend, count, label);
-  target.destroy();
-  return sum;
 }
 
 /**
@@ -383,9 +271,9 @@ export async function runAudioTower(
       "tower.attention.norm",
     );
     dispatches.push(normed.geometry);
-    const q = await projectionPass(runtime, layer.q, normed.output, steps, "tower.q");
-    const k = await projectionPass(runtime, layer.k, normed.output, steps, "tower.k");
-    const v = await projectionPass(runtime, layer.v, normed.output, steps, "tower.v");
+    const q = await matmulPass(runtime, layer.q, normed.output, steps, "tower.q", layer.q.bias);
+    const k = await matmulPass(runtime, layer.k, normed.output, steps, "tower.k", layer.k.bias);
+    const v = await matmulPass(runtime, layer.v, normed.output, steps, "tower.v", layer.v.bias);
     dispatches.push(...q.geometry, ...k.geometry, ...v.geometry);
     normed.output.destroy();
 
@@ -394,11 +282,11 @@ export async function runAudioTower(
     dispatches.push(attended.geometry);
     for (const buffer of [q.output, k.output, v.output]) buffer.destroy();
 
-    const projected = await projectionPass(runtime, layer.out, attended.output, steps,
-      "tower.attention.out");
+    const projected = await matmulPass(runtime, layer.out, attended.output, steps,
+      "tower.attention.out", layer.out.bias);
     dispatches.push(...projected.geometry);
     attended.output.destroy();
-    const attended_residual = await residual(
+    const attended_residual = await residualPass(
       runtime, encoder, projected.output, steps * config.d_model, "tower.residual.attention",
     );
     dispatches.push(attended_residual.geometry);
@@ -410,17 +298,18 @@ export async function runAudioTower(
       "tower.ffn.norm",
     );
     dispatches.push(ffn_normed.geometry);
-    const wide = await projectionPass(runtime, layer.ffn_in, ffn_normed.output, steps, "tower.ffn.in");
+    const wide = await matmulPass(runtime, layer.ffn_in, ffn_normed.output, steps, "tower.ffn.in",
+      layer.ffn_in.bias);
     dispatches.push(...wide.geometry);
     ffn_normed.output.destroy();
     const activated = await geluPass(runtime, wide.output, steps * config.ffn_dim, "tower.ffn.gelu");
     dispatches.push(activated.geometry);
     wide.output.destroy();
-    const block = await projectionPass(runtime, layer.ffn_out, activated.output, steps,
-      "tower.ffn.out");
+    const block = await matmulPass(runtime, layer.ffn_out, activated.output, steps,
+      "tower.ffn.out", layer.ffn_out.bias);
     dispatches.push(...block.geometry);
     activated.output.destroy();
-    const ffn_residual = await residual(
+    const ffn_residual = await residualPass(
       runtime, encoder, block.output, steps * config.d_model, "tower.residual.ffn",
     );
     dispatches.push(ffn_residual.geometry);
