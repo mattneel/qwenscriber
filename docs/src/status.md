@@ -21,8 +21,9 @@ that demonstrates it.
 | Log-mel frontend | Implemented | Fixture comparison against `tools/reference/gen_fixtures.py` output in `src/core/mel.zig` tests |
 | Tokenizer byte alphabet and detokenization | Implemented | `src/core/tokenizer.zig` tests, including malformed tables |
 | Q4/Q5/Q8 packing and dequantization | Implemented | `src/core/quant.zig` tests plus `tests/gpu/layout_drift.mjs` |
-| `wasm32-freestanding` module | Implemented | `zig build wasm` emits a 963 KiB module with no imports |
-| Versioned C-like ABI (v1) | Partial | Exported: version, feature bits, allocator, log-mel, tokenizer, self-test. Model/decode/audio families are not exported yet, and no native C header exists |
+| `wasm32-freestanding` module | Implemented | `zig build wasm` emits a 963 KiB module that resolves zero imports and exports its own memory |
+| Threaded WASM build (`wasm32-emscripten`) | Planned | Sanctioned by ADR-0005 for thread support. Nothing is built yet: there is no emscripten target, no thread-enabled artifact, and no measurement showing threads pay for cross-origin isolation. `capabilities()` already reports `wasmThreads`/`sharedArrayBuffer`/`crossOriginIsolated` so the decision can be made from data |
+| Versioned C-like ABI (v1) | Partial | Exported: ABI/core version, allocator, log-mel, tokenizer/detokenizer, self-test. Model loading and decode are not exported yet, there is no feature-bits query, and no native C header exists |
 | ABI conformance harness | Implemented | `zig build test-wasm` runs `tools/wasm_selftest.mjs` against the real module in Node |
 | TypeScript SDK | Partial | `Qwenscriber.capabilities()`, typed errors, resumable download with digest verification, IndexedDB cache, worker channel, and preprocessing. `transcribe`/`stream` exist as declared surfaces only |
 | Browser example page | Experimental | `examples/browser` loads the module in a worker and reports capabilities; not yet a transcription demo |
@@ -31,7 +32,7 @@ that demonstrates it.
 | Safetensors reading and model conversion | Partial | `src/host/{safetensors,manifest,convert}.zig` and `qwenscriber-convert`; conversion of the official 0.6B checkpoint is in progress |
 | Qwen3-ASR 0.6B transcription | Partial | `qwenscriber-transcribe` drives the real checkpoint end to end; transcript validation in progress |
 | WASM SIMD execution path | Partial | The core is built for `simd128` and host/WASM self-tests agree; full-model inference has not been run through WASM |
-| WGSL kernel suite | Experimental | 8 kernels in `gpu/shaders`; compared against Zig CPU references by `tests/gpu` on this host, not in CI |
+| WGSL kernel suite | Experimental | 8 kernels in `gpu/shaders`; `node tests/gpu/harness.mjs` compares 11 cases against Zig CPU references and passes under SwiftShader on this host (worst case: RoPE `max_abs` 5.0e-4), including a `quant_hash` oracle that matches the Zig self-test bit for bit |
 | WebGPU backend integration | Planned | Kernels exist, but the SDK does not yet dispatch them |
 | Qwen3-ASR 1.7B | Planned | The configuration, layout, and quantized formats are model-agnostic; no 1.7B run has been attempted |
 | Streaming transcription | Planned | No surface implemented |
@@ -47,15 +48,16 @@ zig build test-wasm     # ABI conformance against the built module
 node tests/gpu/layout_drift.mjs   # shader/constant drift gate
 ```
 
-The GPU conformance harness (`node tests/gpu/driver.mjs`) needs a Chromium with WebGPU enabled and a
+The GPU conformance harness (`node tests/gpu/harness.mjs`) needs a Chromium with WebGPU enabled and a
 GPU adapter; it is not part of the default command set.
 
 ## Not yet true
 
 - No release, package, or artifact has been published.
-- `.github/workflows/ci.yml` exists but has not run on GitHub yet, so ADR-0004 has no enforcement
-  behind it at the time of writing. The gates it runs are the same commands listed above, plus
-  `zig build check`.
+- CI has run once on `main`. The Zig gate, shader drift gate, and TypeScript SDK jobs passed; the
+  Documentation job failed on an mdBook config field that mdBook 0.5 removed, which is fixed. The book
+  is now published to GitHub Pages from `main`, which requires the repository's Pages source to be set
+  to "GitHub Actions" once.
 - No performance number on this page has been measured under the benchmark hooks described in the
   architecture pages.
 

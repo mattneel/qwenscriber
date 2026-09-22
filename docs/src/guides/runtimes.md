@@ -19,8 +19,10 @@ decode, and error semantics.
 ## Cloudflare Workers and edge runtimes
 
 The freestanding WASM module avoids WASI, Node, and libc assumptions, making it structurally suitable
-for Worker-like hosts. Actual full-model viability depends on runtime bytecode, memory, CPU-duration,
-artifact-fetch, and GPU limits. Do not market compatibility until a target is tested end to end.
+for Worker-like hosts — and it is the default precisely because most edge runtimes cannot grant
+cross-origin isolation or a `SharedArrayBuffer`, which the thread-enabled build needs. Actual full-model
+viability depends on runtime bytecode, memory, CPU-duration, artifact-fetch, and GPU limits. Do not
+market compatibility until a target is tested end to end.
 
 A Worker adapter must provide explicit bytes, cache/fetch operations, and timing/cancellation from
 the host. The core must not grow ambient network or filesystem assumptions to support it.

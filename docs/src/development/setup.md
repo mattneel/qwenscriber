@@ -15,7 +15,9 @@ Additional areas may require:
 
 - the repository-selected TypeScript package manager;
 - mdBook for documentation previews;
-- browser automation for WebGPU integration tests; and
+- browser automation for WebGPU integration tests;
+- the Emscripten SDK, only when working on the thread-enabled WASM build
+  ([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)); and
 - official Qwen3-ASR model/configuration sources for conversion work.
 
 Do not introduce a package manager or framework merely to avoid a small bounded implementation.

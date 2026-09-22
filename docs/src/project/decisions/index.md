@@ -9,6 +9,7 @@ compatibility.
 | [0002](0002-stable-abi.md) | Small versioned C-like ABI | Accepted |
 | [0003](0003-model-format.md) | Purpose-built sharded quantized model format | Accepted |
 | [0004](0004-ci-release-authority.md) | CI is release authority | Accepted |
+| [0005](0005-thread-enabled-wasm-build.md) | Thread-enabled WASM build via Emscripten | Accepted |
 
 “Accepted” means the project has chosen the direction. It does not imply the implementation is
 complete. Supersede an ADR with a new one rather than rewriting the old decision's history.

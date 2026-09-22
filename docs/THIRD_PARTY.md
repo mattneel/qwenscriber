@@ -53,7 +53,10 @@ Zig converter and runtime do not call into Python.
 | TypeScript | Apache-2.0 | The SDK's only development dependency |
 | Playwright | Apache-2.0 | Drives a real browser for GPU verification (`tools/browser/run-page.mjs`) |
 | PyTorch, NumPy, SoundFile | BSD-3-Clause / BSD-3-Clause / BSD-3-Clause | Used by the reference scripts under `tools/reference/` only |
+| Emscripten | MIT / University of Illinois | Planned build toolchain for the thread-enabled `wasm32-emscripten` module only ([ADR-0005](src/project/decisions/0005-thread-enabled-wasm-build.md)); no thread-enabled artifact exists yet |
 
-None of these are runtime dependencies of the browser build. The browser build
-has no dependencies at all: it is one TypeScript package and one WASM module with
-no imports.
+None of these are runtime dependencies of the browser build. The default
+`wasm32-freestanding` browser build has no dependencies at all: one TypeScript
+package and one WASM module that resolves zero imports. The planned threaded build
+would be Emscripten-compiled and would therefore carry Emscripten's in-module
+runtime and host glue, which is the cost ADR-0005 records.

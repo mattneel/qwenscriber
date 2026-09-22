@@ -50,8 +50,13 @@ possible.
 - Target the repository-pinned Zig master toolchain (`0.17.0-dev` lineage), not an older stable
   release by habit.
 - Verify APIs against the installed compiler. Zig master moves; stale examples are not evidence.
-- The browser core targets `wasm32-freestanding`.
-- The WASM core must not require WASI, Emscripten, libc, Node, or an embedded JavaScript runtime.
+- The browser core builds for `wasm32-freestanding` by default: single-threaded, zero imports, no libc,
+  no WASI, no Node, no embedded JavaScript runtime.
+- A second, thread-enabled `wasm32-emscripten` build is sanctioned when threads are needed
+  ([ADR-0005](docs/src/project/decisions/0005-thread-enabled-wasm-build.md)). It may link pthread/libc
+  inside the module and does not change the ABI. Core sources stay free of operating-system
+  assumptions; only the build, its host glue, and the thread runtime differ. Threads require a
+  `SharedArrayBuffer`, and therefore cross-origin isolation on the embedding page.
 - The root `build.zig` is authoritative for Zig artifacts.
 - Keep the expected commands working as their steps land:
   `zig build`, `zig build test`, `zig build wasm`, and `zig build test-wasm`.
@@ -70,8 +75,9 @@ Prefer dependencies in this order:
 
 Prefer implementing small, bounded functionality over importing a large general-purpose package.
 The browser runtime should have zero production dependencies unless a dependency clears a high
-bar. Do not introduce ONNX Runtime, TensorFlow, PyTorch, llama.cpp, ggml, Emscripten, or a giant
-JavaScript ML framework as a runtime dependency.
+bar. Do not introduce ONNX Runtime, TensorFlow, PyTorch, llama.cpp, ggml, or a giant
+JavaScript ML framework as a runtime dependency. Emscripten is permitted only as the toolchain for
+the thread-enabled WASM build (ADR-0005), never as an application dependency.
 
 Record each new dependency's purpose, license, update mechanism, and why a smaller option was not
 sufficient.

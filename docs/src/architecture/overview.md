@@ -34,7 +34,8 @@ fallback and an oracle for GPU conformance, not an excuse to compromise the WebG
 ## Architectural constraints
 
 - Qwen3-ASR 0.6B must not create hard-coded assumptions that prevent 1.7B.
-- Browser builds are `wasm32-freestanding`, with no WASI, Emscripten, or libc requirement.
+- Browser builds default to `wasm32-freestanding` with no WASI, libc, Node, or JavaScript runtime, and
+  a thread-enabled `wasm32-emscripten` build is sanctioned behind the same ABI (ADR-0005).
 - The ABI is small, explicit, versioned, and C-like.
 - WebGPU limits require shard- or layer-oriented buffers, not one multi-gigabyte allocation.
 - Quantized weights should be unpacked/dequantized inside fused GPU kernels.

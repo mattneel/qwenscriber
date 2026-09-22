@@ -31,6 +31,10 @@ versioned ABI in a browser test.
 - Add adapter-aware shard/buffer planning and GPU-resident weights.
 - Implement Q4 first, then evaluate Q5 from measured behavior.
 - Measure load, latency, real-time factor, memory, and kernel time.
+- Decide the thread-enabled WASM build from measurement
+  ([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)): build `wasm32-emscripten` with
+  pthreads, run the same ABI fixtures against it, and keep it only if the CPU-side path improves enough
+  to justify requiring cross-origin isolation.
 
 **Exit:** 0.6B WebGPU output conforms to the reference path and has reproducible measurements.
 

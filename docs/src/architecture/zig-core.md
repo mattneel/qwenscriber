@@ -19,11 +19,19 @@ The exact source tree may evolve, but responsibilities should remain separable:
 | Tensor SIMD | Measured vectorized CPU/WASM implementations |
 | Runtime | Bounded state, arenas, scratch planning, model/session ownership |
 
-## Freestanding WASM
+## WASM builds
 
-The browser module targets `wasm32-freestanding`. It supplies its own explicit allocation surface
-and imports only the minimal host functions the ABI documents. It must not assume filesystem,
-environment, clock, threads, sockets, libc, WASI, Node, or Emscripten.
+The core compiles to two sanctioned WASM targets, with one ABI
+([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)):
+
+| Build | Target | Properties |
+| --- | --- | --- |
+| Default | `wasm32-freestanding` | Single-threaded, zero imports, no libc, no WASI, no embedded JS runtime. The portability build and the cross-target correctness oracle |
+| Threaded | `wasm32-emscripten` | Links pthread/libc inside the module and uses Emscripten's host glue; needs `SharedArrayBuffer` and therefore cross-origin isolation |
+
+Neither build assumes filesystem, environment, clock, network, or Node inside the core. The
+freestanding build supplies its own explicit allocation surface; the threaded build keeps the same ABI
+and changes only how work is distributed inside the module.
 
 Use idiomatic Zig vectors first for SIMD. Inspect emitted code and benchmarks before adding raw WASM
 intrinsics or handwritten modules.

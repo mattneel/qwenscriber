@@ -41,6 +41,15 @@ Large model checkpoints do not belong in git. End-to-end jobs obtain identified 
 controlled cache/source, verify checksums, and separate artifact/network failures from runtime test
 failures. PR checks should retain a fast deterministic subset.
 
+## WASM build parity
+
+Both sanctioned WASM builds ([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)) run the
+same ABI conformance harness against the same fixtures. The threaded build changes how work is
+distributed inside the module, never what a call returns, so a behavior that holds in one build and not
+the other is a defect in the other rather than an accepted variation. Cross-target parity is already
+tested this way for the native and freestanding builds (`zig build selftest` versus
+`tools/wasm_selftest.mjs`), and the threaded build joins that comparison when it exists.
+
 ## Fuzzing
 
 Manifest/container parsing, ABI byte ranges, audio headers/adapters, tokenizer inputs, and handle

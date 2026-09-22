@@ -39,6 +39,18 @@ Each function documents who owns every input and output, how long borrowed bytes
 which operation releases each handle. A buffer allocated by one allocator is never freed by another
 without an explicit matching function.
 
+## One ABI, two WASM builds
+
+The ABI is a property of the core's source, not of the toolchain that compiled it. Both sanctioned
+builds — the default `wasm32-freestanding` module and the thread-enabled `wasm32-emscripten` module
+([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)) — export the same entry points
+with the same semantics, and the ABI self-test runs against both.
+
+What differs is instantiation: the freestanding module resolves zero imports and exports its own
+memory, while the threaded module imports its host glue and requires a shared memory, which in a
+browser means cross-origin isolation. A host loader must therefore supply an import object for the
+threaded build and must not assume that a module with imports is a broken artifact.
+
 ## Errors versus traps
 
 Malformed input, unsupported versions/features, insufficient caller buffers, resource limits,

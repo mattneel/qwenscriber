@@ -32,9 +32,15 @@ The WASM backend is:
 
 It is not a reason to route the WebGPU backend through CPU memory for every tensor operation.
 
+Two builds of it exist, with identical semantics and the same ABI
+([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)): the default single-threaded
+`wasm32-freestanding` module, and a planned thread-enabled `wasm32-emscripten` module. The threaded
+build is only eligible when the host has `wasmThreads`, `sharedArrayBuffer`, and cross-origin
+isolation; otherwise `auto` resolves to the default build without changing observable behavior.
+
 ## Capability selection
 
 `auto` should evaluate the whole requirement set: WebGPU availability, adapter limits, required
-shader features, model/quantization compatibility, WASM SIMD, Workers, and memory budget. Selection
-must be explainable through capability diagnostics.
+shader features, model/quantization compatibility, WASM SIMD, thread availability, Workers, and memory
+budget. Selection must be explainable through capability diagnostics.
 

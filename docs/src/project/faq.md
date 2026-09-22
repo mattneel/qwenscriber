@@ -18,7 +18,7 @@ controls its own network behavior and can upload anything it chooses.
 ## Why not use ONNX Runtime, TensorFlow, PyTorch, llama.cpp, or ggml?
 
 The project goal is a small purpose-built runtime with direct control over browser memory, packed
-weights, WebGPU kernels, freestanding WASM, and distribution. Those projects can inform correctness
+weights, WebGPU kernels, WASM builds, and distribution. Those projects can inform correctness
 work subject to licensing; they are not runtime dependencies.
 
 ## Why not use GGUF directly?
@@ -40,8 +40,20 @@ promised to be pleasant everywhere.
 
 ## Does it require SharedArrayBuffer?
 
-The basic non-streaming API should avoid requiring it where reasonable. Streaming may use it as a
-capability-gated optimization with documented alternatives.
+Not for the default build. The non-streaming API avoids requiring it, and the default
+`wasm32-freestanding` module runs in a worker without it. Two things do use it, both capability-gated:
+streaming, where shared memory materially improves latency, and the thread-enabled
+`wasm32-emscripten` build ([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)), which
+needs a `SharedArrayBuffer` and therefore cross-origin isolation (COOP/COEP) on the embedding page. A
+page that cannot set those headers still transcribes; it just runs single-threaded.
+
+## Why does Emscripten appear at all if dependencies are so restricted?
+
+Because the WASM threads proposal cannot create a thread: a module can use atomics and shared memory,
+but only the host can instantiate it in several workers. Emscripten supplies that runtime, so it is
+sanctioned as a build toolchain for one optional artifact —
+[ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md) — and never as a runtime dependency
+of an application or of the default build.
 
 ## Can I use it from Elixir or another native language?
 

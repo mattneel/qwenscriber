@@ -50,12 +50,15 @@ can run and why a backend was selected. Expected categories include:
 
 - WebGPU presence and relevant adapter limits;
 - WASM SIMD support;
+- WASM thread support, `SharedArrayBuffer` availability, and cross-origin isolation as three separate
+  facts, because threads need all three and a page can easily have one or two;
 - Worker and AudioWorklet support;
-- `SharedArrayBuffer` availability;
 - compatible quantization/layout features; and
 - selected backend after creation.
 
-Raw adapter/vendor detail should be opt-in diagnostics, not ordinary application API surface.
+Raw adapter/vendor detail should be opt-in diagnostics, not ordinary application API surface. Thread
+support is a *request*, not an assumption: the default artifact is single-threaded, and the SDK never
+requires the embedder to set COOP/COEP ([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)).
 
 ## Errors
 

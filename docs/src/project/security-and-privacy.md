@@ -44,8 +44,12 @@ Cancellation must release staged network, WASM, Worker, and GPU resources.
 ## Browser boundary
 
 WASM and Worker isolation reduce blast radius but do not replace validation. Cross-origin isolation
-and `SharedArrayBuffer` are optional for basic non-streaming use where feasible. Content Security
-Policy and model origin recommendations will be specified with the published package.
+and `SharedArrayBuffer` are optional for basic non-streaming use: the default build never needs them.
+The thread-enabled build does require them
+([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)), which is a page-level policy the
+SDK reports rather than assumes — and cross-origin isolation is itself a security-relevant posture, so
+enabling it is the embedder's decision. Content Security Policy and model origin recommendations will
+be specified with the published package.
 
 ## Disclosure
 

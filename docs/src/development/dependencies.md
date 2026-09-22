@@ -16,8 +16,16 @@ Implement small bounded functionality locally rather than importing a general-pu
 ## Browser rule
 
 Strongly prefer zero production dependencies in the browser runtime. Qwenscriber owns its inference
-runtime. Do not add ONNX Runtime, TensorFlow, PyTorch, llama.cpp, ggml, Emscripten, or a giant
-JavaScript ML framework as a runtime dependency.
+runtime. Do not add ONNX Runtime, TensorFlow, PyTorch, llama.cpp, ggml, or a giant JavaScript ML
+framework as a runtime dependency.
+
+Emscripten is the one sanctioned exception, and only as a **build toolchain** for the thread-enabled
+`wasm32-emscripten` module ([ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md)): it
+supplies the pthread runtime that a freestanding WASM module cannot create for itself. It is not
+required to embed or use Qwenscriber, it does not become part of an application's dependency list, and
+the default `wasm32-freestanding` build stays free of it. Its cost is recorded like any other
+dependency: larger artifact, host glue to load, an emsdk step in CI, and a `SharedArrayBuffer`
+requirement that follows from threads rather than from Emscripten.
 
 Projects may be studied for algorithms, tensor layouts, quantization schemes, formats, and
 correctness comparisons subject to their licenses. Study is not permission to copy incompatible

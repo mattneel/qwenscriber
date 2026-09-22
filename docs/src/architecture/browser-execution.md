@@ -14,6 +14,14 @@ The non-streaming API should not require `SharedArrayBuffer` when ordinary trans
 provide a reasonable path. Streaming may use shared memory where it materially improves latency,
 with capability-gated alternatives.
 
+Inside a worker, the core may itself use threads. Threads require a `SharedArrayBuffer`, and browsers
+only let a page *instantiate* shared memory when it is cross-origin isolated, so a thread-enabled build
+means the embedding page sends COOP/COEP headers. Because that is a host-page policy the SDK cannot
+impose, thread use is capability-gated end to end: `capabilities()` reports `wasmThreads`,
+`sharedArrayBuffer`, and `crossOriginIsolated` separately, the threaded build is selected only when all
+three hold, and the single-threaded `wasm32-freestanding` build remains the default artifact. See
+[ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md).
+
 ## Model loading
 
 Model loading is an observable, cancellable process:

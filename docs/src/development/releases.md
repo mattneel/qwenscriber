@@ -9,7 +9,9 @@ A release may include:
 
 - native core static/shared libraries and `qwenscriber.h`;
 - native CLI/conversion/inspection binaries per supported platform;
-- the `wasm32-freestanding` module;
+- the `wasm32-freestanding` module, and, when it exists, the thread-enabled `wasm32-emscripten`
+  module, each identified in the artifact metadata (they are not byte-interchangeable even though the
+  ABI matches: [ADR-0005](../project/decisions/0005-thread-enabled-wasm-build.md));
 - the TypeScript package containing or resolving the matching WASM artifact;
 - approved language integration packages;
 - model converter artifacts, never third-party model weights by accident;
@@ -23,7 +25,8 @@ version, model-format version, source revision, and toolchain.
 
 1. Check formatting, generated-file drift, licenses, and repository hygiene.
 2. Build/test Zig natively with the pinned Zig master revision.
-3. Build/test deterministic `wasm32-freestanding` artifacts with intended SIMD features.
+3. Build/test deterministic `wasm32-freestanding` artifacts with intended SIMD features, and run the
+   same ABI conformance fixtures against the thread-enabled build once it exists.
 4. Run ABI/layout/format fixtures and CPU-versus-WGSL conformance.
 5. Run TypeScript/browser/integration tests on the supported matrix.
 6. Build native target archives and language packages from the same source revision.
@@ -31,6 +34,11 @@ version, model-format version, source revision, and toolchain.
 8. Generate checksums, SBOM, and provenance.
 9. Publish immutable GitHub Release assets and package-registry artifacts.
 10. Deploy the already-validated mdBook output/source revision to GitHub Pages.
+
+The book is published by the `pages` job in `.github/workflows/ci.yml` from `main` only, and the job
+deploys the artifact the `book` job already built rather than rebuilding it. This requires the
+repository's Pages source to be set to "GitHub Actions" once; the deploy job fails loudly rather than
+silently, which is the intended behavior for a misconfigured publication path.
 
 Publishing begins only after validation. A failed target does not produce a partial release carrying
 the same version.

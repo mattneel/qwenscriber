@@ -1,5 +1,9 @@
-//! WASM ABI v1: the complete contract between the freestanding core and
-//! JavaScript.
+//! WASM ABI v1: the complete contract between the core and JavaScript.
+//!
+//! The contract belongs to the core's source, not to a toolchain: the
+//! `wasm32-freestanding` build and the thread-enabled `wasm32-emscripten` build
+//! (ADR-0005) export the same entry points with the same semantics. What differs
+//! between them is instantiation — imports and memory — not this file.
 //!
 //! The ABI is deliberately C-like and boring: fixed-width integers, linear
 //! memory offsets, explicit lengths, and machine-readable error codes. No Zig
@@ -89,10 +93,24 @@ pub fn statusFromError(err: anyerror) Status {
         error.CountOverflow,
         error.LayoutOverflow,
         error.OutputShapeMismatch,
+        // The model family: a tensor or prompt whose shape contradicts the
+        // configuration is the same class of failure as a mel buffer that is
+        // the wrong size.
+        error.UnexpectedShape,
+        error.PromptMismatch,
         => .shape_mismatch,
         error.InvalidState => .invalid_state,
-        error.LimitExceeded, error.FrameCountExceedsCapacity => .limit_exceeded,
+        error.LimitExceeded,
+        error.FrameCountExceedsCapacity,
+        // The model's own capacity budgets: positions the decoder may address,
+        // and the packed encoder sequence a clip may need.
+        error.CapacityExceeded,
+        error.PositionExceeded,
+        => .limit_exceeded,
         error.NotFound, error.UnknownToken => .not_found,
+        // A required tensor that no supplied shard carries is the model-family
+        // spelling of `not_found`: the caller is missing a file.
+        error.MissingTensor, error.MissingShard => .not_found,
         error.Truncated,
         error.LengthMismatch,
         error.CutShort,
@@ -103,6 +121,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.MalformedTable,
         => .invalid_encoding,
         error.AudioTooLong, error.FrameCountExceedsAudio => .audio_too_long,
+        // A duplicate shard or tensor means the caller's inputs are ambiguous,
+        // which is an argument problem rather than a state problem.
+        error.DuplicateShard, error.DuplicateTensor => .invalid_argument,
         else => .invalid_argument,
     };
 }
@@ -130,6 +151,42 @@ pub fn statusMessage(status: Status) []const u8 {
         .audio_too_long => "audio too long",
     };
 }
+
+/// `qw_features`: the capability families compiled into this build.
+///
+/// The bits exist so JavaScript negotiates instead of guessing. A module built
+/// from an older source of the same ABI version simply has the model and decode
+/// bits clear, and the SDK reports the missing stage as `not_implemented`
+/// rather than calling an export that does not exist.
+pub const Feature = enum(u32) {
+    /// `qw_mel_*`: the log-mel frontend.
+    mel = 1 << 0,
+    /// `qw_tokenizer_set` and `qw_detokenize`.
+    tokenizer = 1 << 1,
+    /// `qw_selftest`.
+    selftest = 1 << 2,
+    /// `qw_model_*`: container parsing and model loading.
+    model = 1 << 3,
+    /// `qw_decode_*`: audio tower, projector, and greedy decoding.
+    decode = 1 << 4,
+
+    pub fn bit(self: Feature) u32 {
+        return @backingInt(self);
+    }
+};
+
+/// Every feature family `src/wasm/exports.zig` publishes.
+///
+/// The mask is written out rather than derived from the enum's field list,
+/// because clearing a bit has to be a deliberate edit: a build that drops a
+/// family must also drop its exports, and this constant is what tells
+/// JavaScript which of the two happened.
+pub const features: u32 =
+    Feature.mel.bit() |
+    Feature.tokenizer.bit() |
+    Feature.selftest.bit() |
+    Feature.model.bit() |
+    Feature.decode.bit();
 
 /// `qw_mel_result`: written by `qw_mel_compute`.
 ///
@@ -180,12 +237,62 @@ pub const TokenizerDescriptor = extern struct {
 
 pub const handle_max: u32 = 1;
 
+/// `qw_model_requirements`: what a loaded model keeps resident, and the limits
+/// it decodes within. Written by `qw_model_requirements`.
+///
+///     offset  0  u64  weight_bytes        shard bytes the caller supplied
+///     offset  8  u64  cache_bytes         key and value cache, all layers
+///     offset 16  u64  scratch_bytes       activations, rotary tables, logits
+///     offset 24  u64  total_bytes         weight_bytes + cache_bytes + scratch_bytes
+///     offset 32  u32  max_positions       decoder positions the cache addresses
+///     offset 36  u32  max_audio_frames    mel frames one clip may hold
+///     offset 40  u32  max_decode_tokens   token budget of one utterance
+///     offset 44  u32  reserved, written as zero
+///
+/// `weight_bytes` counts the shard bytes exactly as the caller supplied them,
+/// container padding included, because the model borrows those buffers instead
+/// of copying them and they must therefore stay resident. The numbers are
+/// measured from the loaded model, not predicted: a caller that needs a
+/// prediction before loading reads the manifest, which carries the same
+/// per-shard byte counts.
+///
+/// `total_bytes` deliberately excludes the small bookkeeping the runtime holds
+/// (tensor bindings, layer tables, the prompt and token buffers, which together
+/// stay under 64 KiB for a 0.6B model) and the caller's own buffers: the
+/// configuration, the vocabulary, the log-mel features, and the audio.
+pub const ModelRequirements = extern struct {
+    weight_bytes: u64,
+    cache_bytes: u64,
+    scratch_bytes: u64,
+    total_bytes: u64,
+    max_positions: u32,
+    max_audio_frames: u32,
+    max_decode_tokens: u32,
+    reserved: u32 = 0,
+};
+
 comptime {
     // These sizes are part of the ABI; JavaScript allocates exactly them.
     std.debug.assert(@sizeOf(MelResult) == 16);
     std.debug.assert(@sizeOf(SelfTestResult) == 32);
     std.debug.assert(@sizeOf(TokenizerDescriptor) == 24);
+    std.debug.assert(@sizeOf(ModelRequirements) == 48);
     std.debug.assert(@sizeOf(Status) == 4);
+
+    // Field offsets are documented above and asserted here, so a reordering is
+    // a compile error rather than a silent memory corruption in JavaScript.
+    std.debug.assert(@offsetOf(ModelRequirements, "weight_bytes") == 0);
+    std.debug.assert(@offsetOf(ModelRequirements, "cache_bytes") == 8);
+    std.debug.assert(@offsetOf(ModelRequirements, "scratch_bytes") == 16);
+    std.debug.assert(@offsetOf(ModelRequirements, "total_bytes") == 24);
+    std.debug.assert(@offsetOf(ModelRequirements, "max_positions") == 32);
+    std.debug.assert(@offsetOf(ModelRequirements, "max_audio_frames") == 36);
+    std.debug.assert(@offsetOf(ModelRequirements, "max_decode_tokens") == 40);
+    std.debug.assert(@offsetOf(ModelRequirements, "reserved") == 44);
+
+    // Feature bits are a mask, so every family must own exactly one bit.
+    std.debug.assert(@popCount(features) == 5);
+    std.debug.assert(features == @as(u32, 0b1_1111));
 }
 
 test "version packing is major-then-minor" {
@@ -218,4 +325,33 @@ test "errors map to the status a caller can act on" {
         Status.invalid_argument,
         statusFromError(error.SomethingNobodyDeclared),
     );
+}
+
+test "model failures map to the status a caller can act on" {
+    try std.testing.expectEqual(Status.not_found, statusFromError(error.MissingTensor));
+    try std.testing.expectEqual(Status.not_found, statusFromError(error.MissingShard));
+    try std.testing.expectEqual(Status.shape_mismatch, statusFromError(error.UnexpectedShape));
+    try std.testing.expectEqual(Status.shape_mismatch, statusFromError(error.PromptMismatch));
+    try std.testing.expectEqual(Status.limit_exceeded, statusFromError(error.CapacityExceeded));
+    try std.testing.expectEqual(Status.limit_exceeded, statusFromError(error.PositionExceeded));
+    try std.testing.expectEqual(Status.invalid_argument, statusFromError(error.DuplicateShard));
+    try std.testing.expectEqual(Status.invalid_argument, statusFromError(error.DuplicateTensor));
+    try std.testing.expectEqual(Status.invalid_state, statusFromError(error.InvalidState));
+}
+
+test "the feature mask names every family exactly once" {
+    var seen = std.mem.zeroes([32]bool);
+    inline for (@typeInfo(Feature).@"enum".field_names) |field_name| {
+        const feature: Feature = @field(Feature, field_name);
+        const bit = feature.bit();
+        try std.testing.expect(bit != 0);
+        try std.testing.expectEqual(@as(u32, 1), @popCount(bit));
+        // Every declared family must be published by the mask, or JavaScript
+        // would negotiate a family this build actually exports.
+        try std.testing.expect(features & bit == bit);
+        const index: usize = @intCast(@ctz(bit));
+        try std.testing.expect(index < seen.len);
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+    }
 }
