@@ -17,6 +17,7 @@ import {
   MEL_BINS,
   MEL_CAPACITY_FRAMES,
   MEL_CAPACITY_SAMPLES,
+  MEL_HOP_LENGTH,
   STATUS,
   statusName,
 } from "../src/wasm/abi.ts";
@@ -201,10 +202,13 @@ test("log-mel of a 1 kHz tone lands in band 42 and pads with the range floor", a
   }
 });
 
-test("audio longer than the 30-second capacity is refused before allocating", async () => {
+test("audio beyond the capacity is refused before allocating", async () => {
   const core = await freshCore();
   try {
-    const too_long = new Float32Array(MEL_CAPACITY_SAMPLES + 1);
+    // The capacity is a frame budget, and a final partial hop is dropped rather than counted — the
+    // rule the reference processor follows, and the reason one sample past 30 seconds is accepted:
+    // it produces the same 3000 frames. The boundary is a whole hop past the capacity.
+    const too_long = new Float32Array(MEL_CAPACITY_SAMPLES + MEL_HOP_LENGTH);
     const error = expectStatus(
       () => core.melCompute(too_long),
       STATUS.audio_too_long,
