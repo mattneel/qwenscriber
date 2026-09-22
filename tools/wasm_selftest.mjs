@@ -109,6 +109,8 @@ const required = [
     "qw_model_set_cache_format",
     "qw_model_requirements",
     "qw_model_audio_config",
+    "qw_model_tensor_count",
+    "qw_model_tensor_descriptor",
     "qw_decode_begin",
     "qw_decode_step",
     "qw_decode_tokens",
@@ -416,6 +418,16 @@ function buildShard(values) {
         e.qw_model_audio_config(handle, audioConfigPtr),
         STATUS.invalidState,
         "audio config before begin is refused",
+    );
+    equal(
+        e.qw_model_tensor_count(handle, audioConfigPtr),
+        STATUS.invalidState,
+        "tensor count before begin is refused",
+    );
+    equal(
+        e.qw_model_tensor_descriptor(handle, 0, audioConfigPtr),
+        STATUS.invalidState,
+        "tensor descriptor before begin is refused",
     );
     equal(
         e.qw_model_add_shard(handle, requirementsPtr, 16),
@@ -764,6 +776,78 @@ function exerciseModel(modelDir) {
         `x ${audio.headDim}, chunk ${audio.chunkFrames} frames -> ${audio.chunkSteps} steps, ` +
         `${audio.frequencyBins} bins left, downsample input ${audio.convOutInputFeatures}, ` +
         `projector ${audio.outputDim}`,
+    );
+
+    // The tensor enumeration, which is how a caller locates a weight. The container's own index
+    // answers, so the checks that matter are that every entry names a shard, lies inside it, and
+    // that the one tensor whose shape is independently known -- the first convolution's weight, tied
+    // to the downsample width the audio configuration reports -- comes back as the checkpoint wrote
+    // it: f16, [out][in][3][3], at two bytes per element.
+    const tensorCountPtr = e.qw_alloc(4, 4) >>> 0;
+    const tensorDescPtr = e.qw_alloc(64, 8) >>> 0;
+    check(tensorCountPtr !== 0 && tensorDescPtr !== 0, "allocated the tensor enumeration buffers");
+    equal(e.qw_model_tensor_count(handle, tensorCountPtr), STATUS.ok, "tensor count for the loaded model");
+    const tensorCount = new DataView(e.memory.buffer, tensorCountPtr, 4).getUint32(0, true);
+    check(tensorCount > 0, "the model holds tensors", `${tensorCount}`);
+    equal(
+        e.qw_model_tensor_descriptor(handle, tensorCount, tensorDescPtr),
+        STATUS.notFound,
+        "a descriptor past the end is refused",
+    );
+
+    const read_descriptor = (index) => {
+        const view = new DataView(e.memory.buffer, tensorDescPtr, 64);
+        return {
+            offsetBytes: Number(view.getBigUint64(0, true)),
+            lenBytes: Number(view.getBigUint64(8, true)),
+            kind: view.getUint32(16, true),
+            layer: view.getUint32(20, true),
+            format: view.getUint32(24, true),
+            rank: view.getUint32(28, true),
+            dims: [0, 1, 2, 3].map((axis) => view.getUint32(32 + axis * 4, true)),
+            shardIndex: view.getUint32(48, true),
+            reserved: [view.getUint32(52, true), view.getUint32(56, true), view.getUint32(60, true)],
+        };
+    };
+
+    let convWeight = null;
+    let outsideShard = 0;
+    let reservedWords = 0;
+    let badShard = 0;
+    let failed = 0;
+    for (let index = 0; index < tensorCount; index += 1) {
+        if (e.qw_model_tensor_descriptor(handle, index, tensorDescPtr) !== STATUS.ok) {
+            failed += 1;
+            continue;
+        }
+        // A fresh view each time: the walk allocates nothing, but this keeps it honest if that
+        // ever changes.
+        const tensor = read_descriptor(index);
+        reservedWords += tensor.reserved[0] + tensor.reserved[1] + tensor.reserved[2];
+        if (tensor.shardIndex >= shardBuffers.length) badShard += 1;
+        else if (tensor.offsetBytes + tensor.lenBytes > shardBuffers[tensor.shardIndex].length) outsideShard += 1;
+        // 1 is `audio_conv1_weight` in `src/core/container.zig`; the mirror in the SDK is checked
+        // against that file by the layout drift gate.
+        if (tensor.kind === 1) convWeight = tensor;
+    }
+    equal(failed, 0, "every descriptor is written");
+    equal(reservedWords, 0, "every reserved word is written as zero");
+    equal(badShard, 0, "every descriptor names a shard of this model");
+    equal(outsideShard, 0, "every tensor lies inside the shard it names");
+    check(convWeight !== null, "the first convolution weight is in the enumeration");
+    equal(convWeight.format, 1, "the convolution weight is f16");
+    equal(convWeight.rank, 4, "the convolution weight is [out][in][kernel][kernel]");
+    equal(convWeight.dims[0], audio.downsampleHidden, "its output channels are the downsample width");
+    equal(convWeight.dims[2], 3, "the kernel is 3x3");
+    equal(convWeight.dims[3], 3, "the kernel is 3x3");
+    equal(
+        convWeight.lenBytes,
+        convWeight.dims[0] * convWeight.dims[1] * 9 * 2,
+        "its byte length is the element count at f16",
+    );
+    console.log(
+        `tensors: ${tensorCount} in ${shardBuffers.length} shards, conv1.weight ` +
+        `${convWeight.dims.join("x")} f16, shard ${convWeight.shardIndex} at offset ${convWeight.offsetBytes}`,
     );
 
     // The cache width is chosen before a load, and the requirements say what it costs. The exact

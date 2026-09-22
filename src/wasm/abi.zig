@@ -339,6 +339,48 @@ pub const AudioConfig = extern struct {
     reserved_1: u32 = 0,
 };
 
+/// `qw_model_tensor_descriptor`: where one tensor's bytes are and what they mean. Written by
+/// `qw_model_tensor_descriptor`.
+///
+///     offset  0  u64  offset_bytes   payload offset from the start of the shard file
+///     offset  8  u64  len_bytes      exact payload length, quantization padding included
+///     offset 16  u32  kind           TensorKind value from `src/core/container.zig`
+///     offset 20  u32  layer          encoder block index; 0 for tensors outside a block
+///     offset 24  u32  format         dtype.Format value; quantized formats carry their plane layout
+///     offset 28  u32  rank           1..4, the number of live dimensions
+///     offset 32  u32  dims[0]        outermost dimension, most significant first
+///     offset 36  u32  dims[1]
+///     offset 40  u32  dims[2]
+///     offset 44  u32  dims[3]        written as zero beyond `rank`
+///     offset 48  u32  shard_index    which shard of the model holds the tensor
+///     offset 52  u32  reserved_0, written as zero
+///     offset 56  u32  reserved_1, written as zero
+///     offset 60  u32  reserved_2, written as zero
+///
+/// The offset is absolute within the shard file rather than relative to the payload section, so a
+/// caller that holds the shard bytes -- fetched, cached, or mapped -- can slice the tensor without
+/// knowing the container's header layout. Tensors are enumerated in shard order, and within a shard
+/// in index order, which is also payload order: the container writes them in that order precisely so
+/// a shard moves to a GPU in one piece and each tensor is addressed without further work.
+///
+/// `kind` is the stable identity a caller matches on. The names the container gives those kinds
+/// (`audio.conv1.weight`, `audio.layer.attention.q.weight`, and so on) are not carried here: an
+/// integer stays a fixed-width ABI field, and the mirror of the enum on the JavaScript side is
+/// checked against this file by `tests/gpu/layout_drift.mjs` the way the WGSL constants are.
+pub const TensorDescriptor = extern struct {
+    offset_bytes: u64,
+    len_bytes: u64,
+    kind: u32,
+    layer: u32,
+    format: u32,
+    rank: u32,
+    dims: [4]u32,
+    shard_index: u32,
+    reserved_0: u32 = 0,
+    reserved_1: u32 = 0,
+    reserved_2: u32 = 0,
+};
+
 comptime {
     // These sizes are part of the ABI; JavaScript allocates exactly them.
     std.debug.assert(@sizeOf(MelResult) == 16);
@@ -346,6 +388,7 @@ comptime {
     std.debug.assert(@sizeOf(TokenizerDescriptor) == 24);
     std.debug.assert(@sizeOf(ModelRequirements) == 48);
     std.debug.assert(@sizeOf(AudioConfig) == 72);
+    std.debug.assert(@sizeOf(TensorDescriptor) == 64);
     std.debug.assert(@sizeOf(Status) == 4);
 
     // Field offsets are documented above and asserted here, so a reordering is
@@ -376,6 +419,17 @@ comptime {
     std.debug.assert(@offsetOf(AudioConfig, "layer_norm_eps") == 60);
     std.debug.assert(@offsetOf(AudioConfig, "reserved_0") == 64);
     std.debug.assert(@offsetOf(AudioConfig, "reserved_1") == 68);
+    std.debug.assert(@offsetOf(TensorDescriptor, "offset_bytes") == 0);
+    std.debug.assert(@offsetOf(TensorDescriptor, "len_bytes") == 8);
+    std.debug.assert(@offsetOf(TensorDescriptor, "kind") == 16);
+    std.debug.assert(@offsetOf(TensorDescriptor, "layer") == 20);
+    std.debug.assert(@offsetOf(TensorDescriptor, "format") == 24);
+    std.debug.assert(@offsetOf(TensorDescriptor, "rank") == 28);
+    std.debug.assert(@offsetOf(TensorDescriptor, "dims") == 32);
+    std.debug.assert(@offsetOf(TensorDescriptor, "shard_index") == 48);
+    std.debug.assert(@offsetOf(TensorDescriptor, "reserved_0") == 52);
+    std.debug.assert(@offsetOf(TensorDescriptor, "reserved_1") == 56);
+    std.debug.assert(@offsetOf(TensorDescriptor, "reserved_2") == 60);
 
     // Feature bits are a mask, so every family must own exactly one bit.
     std.debug.assert(@popCount(features) == 5);

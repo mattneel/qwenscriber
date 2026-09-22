@@ -388,6 +388,29 @@ export fn qw_model_requirements(handle: u32, out_ptr: u32) i32 {
     return abi.Status.ok.code();
 }
 
+/// Writes the number of tensors the loaded model holds into a u32.
+///
+/// The count is what a caller enumerates against before asking for descriptors, so it is its own
+/// call rather than a field of one: indexing past the end is an error, not a sentinel descriptor.
+export fn qw_model_tensor_count(handle: u32, out_ptr: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const out = u32Region(out_ptr, 1) orelse return abi.Status.invalid_argument.code();
+    out[0] = model.tensorCount() catch |err| return abi.statusFromError(err).code();
+    return abi.Status.ok.code();
+}
+
+/// Writes an `abi.TensorDescriptor` for tensor `index` of the loaded model.
+///
+/// The model family grows in place, as `qw_model_set_cache_format` and `qw_model_audio_config` did:
+/// a caller that never enumerates tensors sees the behavior it already had.
+export fn qw_model_tensor_descriptor(handle: u32, index: u32, out_ptr: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const out = structRegion(abi.TensorDescriptor, out_ptr) orelse
+        return abi.Status.invalid_argument.code();
+    model.tensorDescriptor(index, out) catch |err| return abi.statusFromError(err).code();
+    return abi.Status.ok.code();
+}
+
 /// Writes an `abi.AudioConfig`: the audio tower's geometry.
 ///
 /// The model family grows in place, as `qw_model_set_cache_format` did: a caller that never asks

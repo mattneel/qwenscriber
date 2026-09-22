@@ -262,6 +262,62 @@ pub const Model = struct {
         assert(out.reserved == 0);
     }
 
+    /// How many tensors the loaded shards hold, across every shard.
+    ///
+    /// This is the bound a caller enumerates against; the container validates every entry as it
+    /// parses, so a count that came out of a malformed shard cannot reach here.
+    pub fn tensorCount(self: *const Model) Error!u32 {
+        // A model exists exactly in the loaded and decoding states, so this is the state check as
+        // well as the lookup.
+        if (self.model == null) return Error.InvalidState;
+        assert(self.state == .loaded or self.state == .decoding);
+        var total: u32 = 0;
+        for (self.shards[0..self.shard_count]) |*file| {
+            total += file.header.tensor_count;
+        }
+        return total;
+    }
+
+    /// Where one tensor's bytes are, by position in that enumeration.
+    ///
+    /// Shards are walked in the order they were added and each shard's index in the order the
+    /// converter wrote it. The offset reported is absolute within the shard file, so a caller
+    /// holding the shard bytes needs nothing else from the container.
+    pub fn tensorDescriptor(self: *const Model, index: u32, out: *abi.TensorDescriptor) Error!void {
+        if (self.model == null) return Error.InvalidState;
+        assert(self.state == .loaded or self.state == .decoding);
+
+        var remaining = index;
+        for (self.shards[0..self.shard_count], 0..) |*file, shard_index| {
+            const count = file.header.tensor_count;
+            if (remaining >= count) {
+                remaining -= count;
+                continue;
+            }
+            const entry = &file.index[remaining];
+            out.* = .{
+                .offset_bytes = @as(u64, file.header.payload_offset_bytes) + entry.offset_bytes,
+                .len_bytes = entry.len_bytes,
+                .kind = entry.kind,
+                .layer = entry.layer,
+                .format = entry.format,
+                .rank = entry.rank,
+                .dims = entry.dims,
+                .shard_index = @intCast(shard_index),
+                .reserved_0 = 0,
+                .reserved_1 = 0,
+                .reserved_2 = 0,
+            };
+            // A caller slices the shard with these, so the range must be inside the file the
+            // container was parsed from -- which `File.parse` established for every entry.
+            assert(out.offset_bytes + out.len_bytes <= file.bytes.len);
+            assert(out.rank >= 1 and out.rank <= 4);
+            assert(out.shard_index < self.shard_count);
+            return;
+        }
+        return Error.NotFound;
+    }
+
     /// The audio tower's geometry, for a caller that dispatches the tower itself.
     ///
     /// Reported from the loaded configuration through the same helpers the core's forward pass
