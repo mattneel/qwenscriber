@@ -1,0 +1,269 @@
+name: release
+
+# Cutting a release is: push a tag. Everything else is CI's job, because ADR-0004
+# makes CI the authority for distributable artifacts — a binary built on a
+# developer machine is a candidate, not a release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag has to match the version in build.zig.zon and in the TypeScript
+# package. That check runs first and fails loudly, because a release whose
+# artifacts disagree about their own version is worse than no release.
+#
+# `workflow_dispatch` re-runs the pipeline for an existing tag, which is what to
+# use when an upload failed or a runner was flaky.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Gates before anything is published
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: The tag, the package, and the runtime must agree
+        run: |
+          tag_version="${TAG#v}"
+          zon_version=$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\([^"]*\)",.*/\1/p' build.zig.zon | head -1)
+          package_version=$(node -p "require('./packages/qwenscriber/package.json').version")
+          echo "tag=${tag_version} build.zig.zon=${zon_version} package.json=${package_version}"
+          if [ "${tag_version}" != "${zon_version}" ] || [ "${tag_version}" != "${package_version}" ]; then
+            echo "::error::version mismatch: bump build.zig.zon and packages/qwenscriber/package.json before tagging"
+            exit 1
+          fi
+      - name: Report toolchain
+        run: zig version
+      - name: Gates (Debug and ReleaseFast)
+        run: |
+          zig build check
+          zig build check -Doptimize=ReleaseFast
+      - name: Shader and quantization layout drift
+        run: node tests/gpu/layout_drift.mjs
+      - name: TypeScript package builds and passes its tests
+        working-directory: packages/qwenscriber
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm run typecheck
+          npm test
+
+  binaries:
+    name: Native tools (${{ matrix.target }})
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pure Zig, so every target is cross-compiled from one runner with no
+          # per-platform toolchain to install or drift.
+          - { target: x86_64-linux-gnu, archive: tar.gz }
+          - { target: aarch64-linux-gnu, archive: tar.gz }
+          - { target: x86_64-macos, archive: tar.gz }
+          - { target: aarch64-macos, archive: tar.gz }
+          - { target: x86_64-windows, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: Build for ${{ matrix.target }}
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+      - name: Record what was built
+        run: |
+          for tool in selftest transcribe convert inspect; do
+            file "zig-out/bin/qwenscriber-${tool}" || true
+          done
+      - name: Package
+        run: |
+          name="qwenscriber-${TAG#v}-${{ matrix.target }}"
+          mkdir -p package/bin
+          cp zig-out/bin/qwenscriber-selftest \
+             zig-out/bin/qwenscriber-transcribe \
+             zig-out/bin/qwenscriber-convert \
+             zig-out/bin/qwenscriber-inspect \
+             package/bin/
+          cp README.md package/
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd package && zip -qr "../${name}.zip" .)
+          else
+            tar -czf "${name}.tar.gz" -C package .
+          fi
+          ls -la "${name}".*
+          echo "ARCHIVE=${name}.${{ matrix.archive }}" >> "${GITHUB_ENV}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: qwenscriber-*.tar.gz
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: matrix.archive == 'zip'
+        with:
+          name: native-${{ matrix.target }}-zip
+          path: qwenscriber-*.zip
+          if-no-files-found: error
+
+  wasm:
+    name: WASM module
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 1
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build the freestanding module
+        run: zig build wasm
+      - name: Prove it instantiates and computes before it ships
+        run: zig build test-wasm
+      - name: Package
+        run: |
+          name="qwenscriber-core-${TAG#v}"
+          cp zig-out/bin/qwenscriber_core.wasm "${name}.wasm"
+          ls -la "${name}.wasm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm
+          path: qwenscriber-core-*.wasm
+          if-no-files-found: error
+
+  typescript:
+    name: TypeScript package
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: Build the module the package embeds
+        run: zig build wasm
+      - name: Pack
+        working-directory: packages/qwenscriber
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm pack --pack-destination ../../
+          ls -la ../../qwenscriber-qwenscriber-*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: typescript
+          path: qwenscriber-qwenscriber-*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Checksums, provenance, and the GitHub Release
+    needs: [binaries, wasm, typescript]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Checksums
+        working-directory: release
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Provenance
+        working-directory: release
+        run: |
+          cat > provenance.json <<JSON
+          {
+            "tag": "${TAG}",
+            "commit": "${GITHUB_SHA}",
+            "source_ref": "${GITHUB_REF}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "run": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}",
+            "abi_version": "$(sed -n 's/^pub const major: u32 = \(.*\);$/major=\1/p' src/wasm/abi.zig)$(sed -n 's/^pub const minor: u32 = \(.*\);$/minor=\1/p' src/wasm/abi.zig)",
+            "model_format_version": "$(sed -n 's/^pub const format_version: u32 = \(.*\);$/\1/p' src/core/model_config.zig | head -1)",
+            "quantization": ["q4", "q5", "q8", "none"],
+            "native_targets": ["x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-macos", "aarch64-macos", "x86_64-windows"],
+            "toolchain": {
+              "zig_pin": "$(sed -n 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"\([^"]*\)",.*/\1/p' build.zig.zon | head -1)",
+              "zig_used": "$(zig version)",
+              "node_used": "$(node --version)"
+            },
+            "artifacts": [
+          JSON
+          first=1
+          for file in $(ls -1 | grep -v -e '^SHA256SUMS$' -e '^provenance.json$' | sort); do
+            digest=$(sha256sum "${file}" | cut -d' ' -f1)
+            bytes=$(stat -c %s "${file}")
+            if [ "${first}" = "0" ]; then echo "," >> provenance.json; fi
+            first=0
+            printf '    {"name": "%s", "sha256": "%s", "bytes": %s}' "${file}" "${digest}" "${bytes}" >> provenance.json
+          done
+          printf '\n  ]\n}\n' >> provenance.json
+          cat provenance.json
+      - name: Attest the artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.wasm
+            release/*.tgz
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The preamble states what the artifacts are and what is not finished;
+          # GitHub appends its generated notes (commits, contributors, PRs) after it.
+          gh release create "${TAG}" \
+            --title "Qwenscriber ${TAG}" \
+            --notes-file .github/release-notes.md \
+            --generate-notes \
+            --verify-tag \
+            release/*

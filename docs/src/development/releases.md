@@ -43,6 +43,36 @@ silently, which is the intended behavior for a misconfigured publication path.
 Publishing begins only after validation. A failed target does not produce a partial release carrying
 the same version.
 
+## Cutting a release
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` does the rest, and refuses to publish if any gate fails:
+
+1. **Version gate.** The tag, `build.zig.zon`, and `packages/qwenscriber/package.json` must agree.
+   Artifacts that disagree about their own version are worse than no release, so this runs before
+   anything is built.
+2. **Gates.** `zig build check` in Debug and in ReleaseFast, the shader/quantization drift check, and
+   the TypeScript package's build, typecheck, and tests.
+3. **Cross-compiled native tools.** The four command line tools are built for
+   `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, `aarch64-macos`, and `x86_64-windows`,
+   all from one runner: they are pure Zig, so no per-platform toolchain has to be installed or kept
+   in step.
+4. **WASM module and TypeScript package**, with the module instantiated and self-tested before it is
+   packaged.
+5. **Checksums, provenance, attestation.** `SHA256SUMS` covers every artifact; `provenance.json`
+   records the source revision, toolchain versions, ABI and model-format versions, and the digest of
+   each file; `actions/attest-build-provenance` signs the artifacts.
+6. **Publication.** `gh release create` with a preamble describing what the artifacts are and what is
+   not finished (`.github/release-notes.md`), followed by GitHub's generated notes for commits,
+   contributors, and merged pull requests.
+
+`workflow_dispatch` re-runs the pipeline for an existing tag, which is the tool for a failed upload or
+a flaky runner. Nothing is published until every job above succeeds, and a partial release is never
+published under the same version.
+
 ## Reproducibility
 
 - Pin the Zig revision and release tooling.

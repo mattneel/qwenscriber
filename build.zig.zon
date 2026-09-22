@@ -1,6 +1,6 @@
 .{
     .name = .qwenscriber,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0xe825f8848c516e58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0-dev.2251+1175a3e99",
     // Qwenscriber deliberately has no Zig package dependencies. The browser
