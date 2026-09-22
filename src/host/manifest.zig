@@ -20,6 +20,15 @@
 const std = @import("std");
 const qwenscriber = @import("qwenscriber");
 
+const json = @import("json_writer.zig");
+
+/// The JSON primitives live in one module so that the manifest and the
+/// transcription metrics cannot drift in how they escape and punctuate.
+const top_indent = json.top_indent;
+const nested_indent = json.nested_indent;
+const numberField = json.numberField;
+const textField = json.textField;
+
 const assert = std.debug.assert;
 
 pub const format_version: u32 = 1;
@@ -113,27 +122,30 @@ pub fn hexOfDigest(digest: []const u8) [64]u8 {
 /// defence against it.
 pub fn write(writer: *std.Io.Writer, value: *const Value) !void {
     try validate(value);
+    assert(value.shards.len > 0);
+    assert(value.config_bytes == qwenscriber.model_config.size_bytes);
     try writer.writeAll("{\n");
-    try numberField(writer, "format_version", value.format_version, false);
-    try textField(writer, "architecture", value.architecture, false);
-    try textField(writer, "model_id", value.model_id, false);
-    try textField(writer, "quantization", value.quantization, false);
+    try numberField(writer, top_indent, "format_version", value.format_version, false);
+    try textField(writer, top_indent, "architecture", value.architecture, false);
+    try textField(writer, top_indent, "model_id", value.model_id, false);
+    try textField(writer, top_indent, "quantization", value.quantization, false);
 
     try writer.writeAll("  \"config\": {\n");
-    try textField(writer, "file", value.config_file, false);
-    try numberField(writer, "bytes", value.config_bytes, true);
+    try textField(writer, nested_indent, "file", value.config_file, false);
+    try numberField(writer, nested_indent, "bytes", value.config_bytes, true);
     try writer.writeAll("  },\n");
 
     try writer.writeAll("  \"tokenizer\": {\n");
-    try textField(writer, "file", value.tokenizer_file, false);
-    try numberField(writer, "bytes", value.tokenizer_bytes, false);
-    try numberField(writer, "count", value.token_count, false);
-    try textField(writer, "merges_file", value.merges_file, false);
-    try numberField(writer, "merges_bytes", value.merges_bytes, true);
+    try textField(writer, nested_indent, "file", value.tokenizer_file, false);
+    try numberField(writer, nested_indent, "bytes", value.tokenizer_bytes, false);
+    try numberField(writer, nested_indent, "count", value.token_count, false);
+    try textField(writer, nested_indent, "merges_file", value.merges_file, false);
+    try numberField(writer, nested_indent, "merges_bytes", value.merges_bytes, true);
     try writer.writeAll("  },\n");
 
     try rawField(
         writer,
+        top_indent,
         "output_is_tied",
         if (value.output_is_tied) "true" else "false",
         false,
@@ -155,72 +167,25 @@ pub fn write(writer: *std.Io.Writer, value: *const Value) !void {
     try writer.writeAll("\n  ],\n");
 
     try writer.writeAll("  \"totals\": {\n");
-    try numberField(writer, "tensors", value.tensors, false);
-    try numberField(writer, "parameters_approximate", value.parameters_approximate, false);
-    try numberField(writer, "payload_bytes", value.payload_bytes, false);
-    // Six decimals: enough to tell q4 (4.250000) from q5 and q8, and fixed so
-    // the bytes do not depend on how the platform prints floats.
-    var bits: [32]u8 = undefined;
-    const bits_text = try std.fmt.bufPrint(&bits, "{d:.6}", .{value.bits_per_weight});
-    try rawField(writer, "bits_per_weight", bits_text, true);
+    try numberField(writer, nested_indent, "tensors", value.tensors, false);
+    try numberField(
+        writer,
+        nested_indent,
+        "parameters_approximate",
+        value.parameters_approximate,
+        false,
+    );
+    try numberField(writer, nested_indent, "payload_bytes", value.payload_bytes, false);
+    // Six decimals: enough to tell q4 (4.250000) from q5 and q8.
+    try json.floatField(writer, nested_indent, "bits_per_weight", value.bits_per_weight, true);
     try writer.writeAll("  },\n");
 
-    try textField(writer, "tool_version", value.tool_version, true);
+    try textField(writer, top_indent, "tool_version", value.tool_version, true);
     try writer.writeAll("}\n");
 }
 
-fn textField(
-    writer: *std.Io.Writer,
-    key: []const u8,
-    text: []const u8,
-    last: bool,
-) !void {
-    try writeKey(writer, key);
-    try writeString(writer, text);
-    try writeTail(writer, last);
-}
-
-fn numberField(writer: *std.Io.Writer, key: []const u8, number: anytype, last: bool) !void {
-    try writeKey(writer, key);
-    try writer.print("{d}", .{number});
-    try writeTail(writer, last);
-}
-
-fn rawField(writer: *std.Io.Writer, key: []const u8, raw: []const u8, last: bool) !void {
-    try writeKey(writer, key);
-    try writer.writeAll(raw);
-    try writeTail(writer, last);
-}
-
-fn writeTail(writer: *std.Io.Writer, last: bool) !void {
-    if (last) {
-        try writer.writeByte('\n');
-    } else {
-        try writer.writeAll(",\n");
-    }
-}
-
-fn writeKey(writer: *std.Io.Writer, key: []const u8) !void {
-    try writer.writeAll("  \"");
-    try writer.writeAll(key);
-    try writer.writeAll("\": ");
-}
-
-fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
-    try writer.writeByte('"');
-    for (text) |byte| {
-        switch (byte) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            0...8, 0x0B, 0x0C, 0x0E...0x1F => try writer.print("\\u{x:0>4}", .{byte}),
-            else => try writer.writeByte(byte),
-        }
-    }
-    try writer.writeByte('"');
-}
+const rawField = json.rawField;
+const writeString = json.writeString;
 
 /// Checks the manifest's internal consistency before it is written: a loader
 /// trusts these fields, so they must not contradict each other.
@@ -253,6 +218,7 @@ pub fn validate(value: *const Value) Error!void {
 /// Reads a manifest back. Used by the inspector, which must be able to describe
 /// a model directory it did not write, and by the round-trip test.
 pub fn read(arena: std.mem.Allocator, bytes: []const u8) Error!Value {
+    assert(bytes.len > 0);
     const Raw = struct {
         format_version: u32,
         architecture: []const u8 = architecture_name,
@@ -284,7 +250,12 @@ pub fn read(arena: std.mem.Allocator, bytes: []const u8) Error!Value {
         tool_version: []const u8 = "",
     };
 
-    const raw = std.json.parseFromSliceLeaky(Raw, arena, bytes, .{ .ignore_unknown_fields = false }) catch |err| {
+    const raw = std.json.parseFromSliceLeaky(
+        Raw,
+        arena,
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    ) catch |err| {
         return switch (err) {
             error.OutOfMemory => Error.OutOfMemory,
             error.MissingField => Error.MissingField,
@@ -523,7 +494,13 @@ test "shard order and consistency are enforced, not assumed" {
     defer buffer.deinit();
     try write(&buffer.writer, &good);
     const text = buffer.written();
-    const bumped = try std.mem.replaceOwned(u8, arena, text, "\"format_version\": 1", "\"format_version\": 2");
+    const bumped = try std.mem.replaceOwned(
+        u8,
+        arena,
+        text,
+        "\"format_version\": 1",
+        "\"format_version\": 2",
+    );
     try std.testing.expectError(Error.UnsupportedVersion, read(arena, bumped));
 
     // Truncated JSON is a malformed manifest, not a partial read.

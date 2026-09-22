@@ -49,7 +49,10 @@ possible.
 
 - Target the repository-pinned Zig master toolchain (`0.17.0-dev` lineage), not an older stable
   release by habit.
-- Verify APIs against the installed compiler. Zig master moves; stale examples are not evidence.
+- Verify APIs against the installed compiler. Zig master moves; stale examples are not evidence. When
+  the compiler disagrees with an assumption, read the error including its `note:` lines and fix the
+  call site — do not stand up a probe project to discover the API. [`docs/GOTCHAS.md`](docs/GOTCHAS.md)
+  records the traps already paid for, and each new one is added there in the change that fixes it.
 - The browser core builds for `wasm32-freestanding` by default: single-threaded, zero imports, no libc,
   no WASI, no Node, no embedded JavaScript runtime.
 - A second, thread-enabled `wasm32-emscripten` build is sanctioned when threads are needed

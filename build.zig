@@ -61,12 +61,33 @@ pub fn build(b: *std.Build) void {
     // Checkpoint reading, name mapping, and conversion. Kept in its own module
     // because none of it is compiled for the freestanding target: it uses
     // `std.json`, an allocator, and the operating system.
+    //
+    // The revision travels with every measured run, so a number can be
+    // attributed to a commit. A build that is not in a git checkout, or that is
+    // built from a release tarball, says `unknown` rather than guessing;
+    // `-Drevision` overrides both, which is what a release build does.
+    const probed_revision = switch (b.runFallible(
+        &.{ "git", "rev-parse", "--short", "HEAD" },
+        .{},
+    )) {
+        .success => |text| std.mem.trim(u8, text, " \t\r\n"),
+        else => @as([]const u8, "unknown"),
+    };
+    const revision = b.option(
+        []const u8,
+        "revision",
+        "Revision recorded in run metrics (default: git's short HEAD)",
+    ) orelse probed_revision;
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "revision", revision);
+
     const host = b.addModule("host", .{
         .root_source_file = b.path("src/host/root.zig"),
         .target = host_target,
         .optimize = host_optimize,
         .imports = &.{
             .{ .name = "qwenscriber", .module = core },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
 
@@ -95,6 +116,7 @@ pub fn build(b: *std.Build) void {
             .optimize = host_optimize,
             .imports = &.{
                 .{ .name = "qwenscriber", .module = core },
+                .{ .name = "host", .module = host },
             },
         }),
     });

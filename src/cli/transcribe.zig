@@ -11,13 +11,14 @@
 //! Usage:
 //!
 //!     qwenscriber-transcribe --model <model dir> --audio <wav> [--max-tokens N]
-//!                            [--dump-encoder] [--dump-logits N]
+//!                            [--dump <dir>] [--dump-logits] [--metrics <path>]
 
 const std = @import("std");
 const Io = std.Io;
 const qw = @import("qwenscriber");
 const wav = @import("wav.zig");
 const fixture = @import("fixture.zig");
+const host = @import("host");
 
 const AudioTooLong = error{AudioTooLong};
 
@@ -80,8 +81,9 @@ pub fn main(init: std.process.Init) !void {
         config.*,
         shard_bytes.items,
     );
+    const load_ms = nowMs(io) - started;
     try out.print("loaded in {d} ms, key/value cache {d} MiB\n", .{
-        nowMs(io) - started,
+        load_ms,
         model.cacheBytes() / (1024 * 1024),
     });
 
@@ -111,9 +113,10 @@ pub fn main(init: std.process.Init) !void {
     const log_mel = try gpa.alloc(f32, @as(usize, qw.mel.mel_bins) * frames);
     const global_max_log = try qw.mel.compute(padded, log_mel, frames);
     const projected_steps = config.packedStepCount(@intCast(frames));
+    const mel_ms = nowMs(io) - preprocessing_started;
     try out.print(
         "mel: {d} frames in {d} ms (global max log {d:.6}), encoder steps {d}\n",
-        .{ frames, nowMs(io) - preprocessing_started, global_max_log, projected_steps },
+        .{ frames, mel_ms, global_max_log, projected_steps },
     );
 
     var dump = try Dump.open(io, gpa, options.dump_path);
@@ -121,10 +124,21 @@ pub fn main(init: std.process.Init) !void {
 
     const projected = try gpa.alloc(f32, @as(usize, projected_steps) * config.text_hidden_size);
     const encoder_started = nowMs(io);
-    const steps = try model.encodeAudio(log_mel, @intCast(frames));
+    // The reference dumps the convolution stack's output on its own, so the dump
+    // is written at the same boundary: comparing it separates a convolution
+    // defect from an audio tower block defect.
+    const steps = try model.encodeConvStage(log_mel, @intCast(frames));
+    try dump.write(
+        io,
+        "audio_conv_out.f32",
+        &.{ config.audioChunkSteps(), config.audio_d_model },
+        model.encodedSteps(steps)[0 .. config.audioChunkSteps() * config.audio_d_model],
+    );
+    try model.encodeTowerStage(steps);
+    const encoder_ms = nowMs(io) - encoder_started;
     try out.print("encoder: {d} steps in {d} ms\n", .{
         steps,
-        nowMs(io) - encoder_started,
+        encoder_ms,
     });
     try dump.write(io, "audio_encoded.f32", &.{ steps, config.audio_d_model }, model.encodedSteps(steps));
     try dump.write(io, "input_features.f32", &.{ config.mel_bins, @intCast(frames) }, log_mel);
@@ -155,8 +169,23 @@ pub fn main(init: std.process.Init) !void {
     var decoder = qw.qwen3_asr.decoder.Decoder.init(&model);
     const decode_started = nowMs(io);
     var next = try decoder.prefill(prompt_tokens[0..prompt_length], projected, steps);
-    try out.print("first token in {d} ms\n", .{nowMs(io) - decode_started});
+    if (options.dump_logits) {
+        // The row the first generated token comes from, which is the only
+        // decoding stage that can be compared against the reference's
+        // `logits_step0.f32` fixture.
+        try dump.write(
+            io,
+            "logits_step0.f32",
+            &.{config.vocab_size},
+            decoder.model.scratch.logits,
+        );
+    }
+    const first_token_ms = nowMs(io) - decode_started;
+    try out.print("first token in {d} ms\n", .{first_token_ms});
 
+    // Generation is timed apart from the prompt's prefill: a user waits through
+    // both, but only this phase scales with how long the answer is.
+    const generation_started = nowMs(io);
     const generated = try gpa.alloc(u32, options.max_tokens);
     var generated_count: usize = 0;
     var token_count: u32 = 0;
@@ -170,15 +199,15 @@ pub fn main(init: std.process.Init) !void {
         next = try decoder.step(next);
     }
 
-    const decode_ms = nowMs(io) - decode_started;
-    const words_per_second = if (decode_ms > 0)
+    const decode_ms = nowMs(io) - generation_started;
+    const tokens_per_second = if (decode_ms > 0)
         @as(f64, @floatFromInt(token_count)) * 1000.0 / @as(f64, @floatFromInt(decode_ms))
     else
         0.0;
     try out.print("decode: {d} tokens in {d} ms ({d:.1} tokens/s)\n", .{
         token_count,
         decode_ms,
-        words_per_second,
+        tokens_per_second,
     });
 
     const generated_as_f32 = try gpa.alloc(f32, generated_count);
@@ -196,13 +225,49 @@ pub fn main(init: std.process.Init) !void {
     try out.print("language: {s}\n", .{if (parsed.hasLanguage()) parsed.language else "(none)"});
     try out.print("transcript: {s}\n", .{parsed.transcript});
     try out.print("generated ids: {any}\n", .{generated[0..generated_count]});
+    const total_ms = nowMs(io) - started;
+    const audio_ms = @divTrunc(@as(i64, @intCast(audio.samples.len)) * 1000, 16000);
     try out.print(
         "total: {d} ms for {d:.2} s of audio\n",
         .{
-            nowMs(io) - started,
+            total_ms,
             @as(f64, @floatFromInt(audio.samples.len)) / 16000.0,
         },
     );
+    if (options.metrics_path.len != 0) {
+        const identity = host.metrics.readIdentity(io, gpa, model_dir);
+        var shard_bytes_total: u64 = 0;
+        for (shard_bytes.items) |shard| shard_bytes_total += shard.len;
+        var cpu_buffer: [128]u8 = undefined;
+        try host.metrics.writeFile(io, options.metrics_path, .{
+            .model_id = identity.model_id,
+            .quantization = identity.quantization,
+            .bits_per_weight = identity.bits_per_weight,
+            .tensors = identity.tensors,
+            .parameters = identity.parameters,
+            .payload_bytes = identity.payload_bytes,
+            .shard_count = @intCast(shard_bytes.items.len),
+            .shard_bytes = shard_bytes_total,
+            .audio_d_model = config.audio_d_model,
+            .audio_layers = config.audio_layers,
+            .text_hidden_size = config.text_hidden_size,
+            .text_layers = config.text_layers,
+            .vocab_size = config.vocab_size,
+            .kv_cache_bytes = model.cacheBytes(),
+            .frames = @intCast(frames),
+            .encoder_steps = @intCast(steps),
+            .prompt_tokens = @intCast(prompt_length),
+            .generated_tokens = token_count,
+            .load_ms = load_ms,
+            .mel_ms = mel_ms,
+            .encoder_ms = encoder_ms,
+            .first_token_ms = first_token_ms,
+            .decode_ms = decode_ms,
+            .total_ms = total_ms,
+            .audio_ms = audio_ms,
+        }, host.metrics.detectEnvironment(io, &cpu_buffer));
+        try out.print("metrics: {s}\n", .{options.metrics_path});
+    }
     try out.flush();
 }
 
@@ -221,6 +286,9 @@ const Options = struct {
     audio_path: []const u8 = "",
     max_tokens: usize = 256,
     dump_path: []const u8 = "",
+    dump_logits: bool = false,
+    /// Where to write the run's metrics record. Empty writes none.
+    metrics_path: []const u8 = "",
     help: bool = false,
 
     fn parse(
@@ -249,6 +317,12 @@ const Options = struct {
                 index += 1;
                 if (index >= args.len) return fail(out, "missing value for --dump");
                 self.dump_path = args[index];
+            } else if (std.mem.eql(u8, arg, "--dump-logits")) {
+                self.dump_logits = true;
+            } else if (std.mem.eql(u8, arg, "--metrics")) {
+                index += 1;
+                if (index >= args.len) return fail(out, "missing value for --metrics");
+                self.metrics_path = args[index];
             } else if (std.mem.eql(u8, arg, "--max-tokens")) {
                 index += 1;
                 if (index >= args.len) return fail(out, "missing value for --max-tokens");
@@ -278,6 +352,8 @@ fn printUsage(out: *Io.Writer) !void {
         \\  --audio <wav>       16 kHz mono WAV file
         \\  --max-tokens <n>    generation limit (default 256)
         \\  --dump <dir>        write intermediate tensors for reference comparison
+        \\  --dump-logits       also write the first step's logits
+        \\  --metrics <path>    write this run's measurements as a JSON record
         \\  --help              show this message
         \\
     , .{});
