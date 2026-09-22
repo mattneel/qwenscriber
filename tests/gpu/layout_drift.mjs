@@ -36,6 +36,7 @@ const zig_container_path = "src/core/container.zig";
 const tensor_kind_path = "packages/qwenscriber/src/gpu/tensor_kind.ts";
 const abi_zig_path = "src/wasm/abi.zig";
 const abi_ts_path = "packages/qwenscriber/src/wasm/abi.ts";
+const quant_ts_path = "packages/qwenscriber/src/gpu/quant_layout.ts";
 const layout_path = "gpu/shaders/quant_layout.wgsl";
 const shader_dir = "gpu/shaders";
 
@@ -431,6 +432,11 @@ const ABI_STRUCTS = [
         size: "MODEL_REQUIREMENTS_BYTES",
         offsets: "MODEL_REQUIREMENTS_OFFSET",
     },
+    {
+        name: "AudioConfig",
+        size: "AUDIO_CONFIG_BYTES",
+        offsets: "AUDIO_CONFIG_OFFSET",
+    },
 ];
 
 // One offset table's body. Field names repeat across tables -- `reserved` is in several -- so the
@@ -503,12 +509,125 @@ function compare_abi_layout() {
     return { rows, problems };
 }
 
+// The TypeScript side of the layout: `quant_layout.ts` mirrors the same constants so a caller can say
+// where a tensor's code plane starts. That is a second copy of one truth, for the browser what the
+// WGSL mirrors are for the shaders, so it is compared here too -- each mirror against the Zig source
+// it came from, with the Zig pattern written out rather than borrowed from `LAYOUT`, whose entries
+// resolve to values in more than one shape.
+const QUANT_TS_CONSTANTS = [
+    {
+        name: "QUANT_GROUP_SIZE",
+        ts: "QUANT_GROUP_SIZE = (\\d+)",
+        zig: "/pub const group_size: u32 = (\\d+);/",
+        reason: "weights per quantization group",
+    },
+    {
+        name: "QUANT_SCALE_BYTES_PER_GROUP",
+        ts: "QUANT_SCALE_BYTES_PER_GROUP = (\\d+)",
+        zig: "/pub const q4_scale_bytes_per_group: u32 = (\\d+);/",
+        reason: "f16 scale bytes per group",
+    },
+    {
+        name: "QUANT_CODE_BYTES_PER_GROUP.q4",
+        ts: "q4: (\\d+),",
+        zig: "/pub const q4_data_bytes_per_group: u32 = (\\d+);/",
+        reason: "packed q4 code bytes per group",
+    },
+    {
+        name: "QUANT_CODE_BYTES_PER_GROUP.q5",
+        ts: "q5: (\\d+),",
+        zig: "/pub const q5_data_bytes_per_group: u32 = (\\d+);/",
+        reason: "packed q5 code bytes per group",
+    },
+    {
+        name: "QUANT_CODE_BYTES_PER_GROUP.q8",
+        // No trailing comma: q8 is the last entry of the table.
+        ts: "q8: (\\d+)",
+        zig: "/pub const q8_data_bytes_per_group: u32 = (\\d+);/",
+        reason: "packed q8 code bytes per group",
+    },
+    {
+        name: "TENSOR_ALIGNMENT_BYTES",
+        ts: "TENSOR_ALIGNMENT_BYTES = (\\d+)",
+        zig: "/pub const tensor_alignment_bytes: u64 = (\\d+);/",
+        reason: "alignment of a quantized payload",
+    },
+    {
+        name: "FORMAT_Q4",
+        ts: "FORMAT_Q4 = (\\d+)",
+        zig: "/^\\s*q4 = (\\d+),/m",
+        dtype: true,
+        reason: "q4 format id",
+    },
+    {
+        name: "FORMAT_Q5",
+        ts: "FORMAT_Q5 = (\\d+)",
+        zig: "/^\\s*q5 = (\\d+),/m",
+        dtype: true,
+        reason: "q5 format id",
+    },
+    {
+        name: "FORMAT_Q8",
+        ts: "FORMAT_Q8 = (\\d+)",
+        zig: "/^\\s*q8 = (\\d+),/m",
+        dtype: true,
+        reason: "q8 format id",
+    },
+];
+
+// `const NAME = 64` / `q4: 32,` in the TypeScript file.
+function ts_constant(text, pattern) {
+    const match = text.match(new RegExp(`(?:const )?${pattern}`));
+    return match === null ? undefined : Number(match[1]);
+}
+
+// `/regex/flags` as written in the table above.
+function zig_constant(text, specification) {
+    const match = specification.match(/^\/(.*)\/([a-z]*)$/s);
+    if (match === null) return undefined;
+    const found = text.match(new RegExp(match[1], match[2]));
+    return found === null ? undefined : Number(found[1]);
+}
+
+function compare_quant_ts() {
+    const problems = [];
+    const quant = source_text(zig_quant_path);
+    const types = source_text(zig_dtype_path);
+    const ts = source_text(quant_ts_path);
+
+    let compared = 0;
+    for (const constant of QUANT_TS_CONSTANTS) {
+        const mirrored = ts_constant(ts, constant.ts);
+        const source = constant.dtype === true ? types : quant;
+        const zig = zig_constant(source, constant.zig);
+        if (mirrored === undefined || zig === undefined) {
+            problems.push(
+                `quant ts: ${constant.name} is not pinned in both files ` +
+                    `(${quant_ts_path}: ${mirrored}, Zig: ${zig})`,
+            );
+            continue;
+        }
+        compared += 1;
+        if (mirrored !== zig) {
+            problems.push(
+                `quant ts: ${constant.name} is ${mirrored} in ${quant_ts_path} and ${zig} in Zig ` +
+                    `(${constant.reason})`,
+            );
+        }
+    }
+    return {
+        rows: [{ name: "quant_layout.ts", detail: `${compared} constants agree with Zig` }],
+        problems,
+    };
+}
+
 const layout = wgsl_constants(source_text(layout_path));
 const compared = compare_layout();
 const structure = check_structure(layout);
 const mirrors = check_kernel_mirrors(layout);
 const kinds = compare_tensor_kinds();
 const abi_layout = compare_abi_layout();
+const quant_ts = compare_quant_ts();
 
 const problems = [
     ...compared.problems,
@@ -516,6 +635,7 @@ const problems = [
     ...mirrors.problems,
     ...kinds.problems,
     ...abi_layout.problems,
+    ...quant_ts.problems,
 ];
 const shader_count = new Set(mirrors.mirrors.map((mirror) => mirror.file)).size;
 
@@ -537,6 +657,10 @@ console.log(
     `layout_drift: tensor kinds compared between ${zig_container_path} and ${tensor_kind_path}`,
 );
 for (const row of kinds.rows) {
+    console.log(`  ${row.name}: ${row.detail}`);
+}
+console.log(`layout_drift: constants compared between ${layout_path} and ${quant_ts_path}`);
+for (const row of quant_ts.rows) {
     console.log(`  ${row.name}: ${row.detail}`);
 }
 console.log(`layout_drift: ABI struct layout compared between ${abi_zig_path} and ${abi_ts_path}`);

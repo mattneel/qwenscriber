@@ -15,12 +15,13 @@
 
 import { QwenscriberError } from "../errors.ts";
 import { STATUS } from "../wasm/abi.ts";
+import { QUANT_CODE_BYTES_PER_GROUP, QUANT_GROUP_SIZE } from "./quant_layout.ts";
 import type { WebGpuRuntime } from "./runtime.ts";
 
-/** Weights per quantization group. Mirrors `quant.group_size`; see the note above about copies. */
-export const Q4_GROUP_SIZE = 64;
+/** Weights per quantization group. Re-exported from `quant_layout.ts`, which the drift gate checks. */
+export const Q4_GROUP_SIZE = QUANT_GROUP_SIZE;
 /** Packed code bytes per q4 group: 64 four-bit codes, two to a byte. */
-export const Q4_CODE_BYTES_PER_GROUP = 32;
+export const Q4_CODE_BYTES_PER_GROUP = QUANT_CODE_BYTES_PER_GROUP.q4;
 /** Weights decoded per tile edge: the workgroup is 16x16, so the tile is 16x16. */
 const MATMUL_TILE = 16;
 

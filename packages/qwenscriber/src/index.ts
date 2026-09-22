@@ -286,6 +286,24 @@ export {
 } from "./gpu/matmul_q4.ts";
 export { shaderSourceFromBaseUrl } from "./gpu/shaders.ts";
 export { TENSOR_KIND, type TensorKind, type TensorKindName } from "./gpu/tensor_kind.ts";
+export { positionEmbedding, runConvStage, type ConvStageResult } from "./gpu/conv_stack.ts";
+export {
+  FORMAT_Q4,
+  FORMAT_Q5,
+  FORMAT_Q8,
+  QUANT_GROUP_SIZE,
+  TENSOR_ALIGNMENT_BYTES,
+  dataPlaneOffsetBytes,
+  formatId,
+  quantFormatOf,
+  type QuantFormat,
+} from "./gpu/quant_layout.ts";
+export {
+  uploadTowerWeights,
+  type ConvStackWeights,
+  type DownsampleWeights,
+  type TowerWeights,
+} from "./gpu/tower_weights.ts";
 export {
   WEBGPU_KERNELS,
   bindGroupLayoutEntries,
