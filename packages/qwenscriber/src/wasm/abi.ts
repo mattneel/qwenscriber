@@ -287,3 +287,122 @@ export function writeTokenizerDescriptor(
   view.setUint32(offset + TOKENIZER_DESCRIPTOR_OFFSET.token_count, descriptor.token_count, true);
   view.setUint32(offset + TOKENIZER_DESCRIPTOR_OFFSET.reserved, descriptor.reserved, true);
 }
+
+// ---------------------------------------------------------------------------
+// Capability families (`qw_features`, abi.Feature)
+// ---------------------------------------------------------------------------
+
+/**
+ * The families `qw_features` reports, one bit each.
+ *
+ * A module built from an older source of the same ABI version reports fewer bits, which is how the
+ * SDK tells "this build cannot load a model" from "the call is wrong" without probing for exports
+ * one at a time.
+ */
+export const FEATURE = {
+  /** `qw_mel_*`: the log-mel frontend. */
+  mel: 1 << 0,
+  /** `qw_tokenizer_set` and `qw_detokenize`. */
+  tokenizer: 1 << 1,
+  /** `qw_selftest`. */
+  selftest: 1 << 2,
+  /** `qw_model_*`: container parsing and model loading. */
+  model: 1 << 3,
+  /** `qw_decode_*`: audio tower, projector, and greedy decoding. */
+  decode: 1 << 4,
+} as const;
+export type FeatureName = keyof typeof FEATURE;
+
+/** Family names in bit order, so `featureNames(mask)` reports them the way `abi.Feature` declares them. */
+export const FEATURE_NAMES: readonly FeatureName[] = [
+  "mel",
+  "tokenizer",
+  "selftest",
+  "model",
+  "decode",
+];
+
+/** Every family `abi.features` publishes. */
+export const FEATURE_ALL: number = FEATURE_NAMES.reduce((mask, name) => mask | FEATURE[name], 0);
+
+// ---------------------------------------------------------------------------
+// Model requirements (`qw_model_requirements`, abi.ModelRequirements)
+// ---------------------------------------------------------------------------
+
+/**
+ * `abi.ModelRequirements`: what a loaded model keeps resident, and the limits it decodes within.
+ * 48 bytes, 8-byte aligned.
+ *
+ *     offset  0  u64  weight_bytes        shard bytes the caller supplied
+ *     offset  8  u64  cache_bytes         key and value cache, all layers
+ *     offset 16  u64  scratch_bytes       activations, rotary tables, logits
+ *     offset 24  u64  total_bytes         weight + cache + scratch
+ *     offset 32  u32  max_positions       decoder positions the cache addresses
+ *     offset 36  u32  max_audio_frames    mel frames one clip may hold
+ *     offset 40  u32  max_decode_tokens   token budget of one utterance
+ *     offset 44  u32  reserved
+ *
+ * `weight_bytes` counts the shard buffers as the caller supplied them, container padding included,
+ * because the model borrows them instead of copying: they are resident for as long as the model is.
+ * The runtime's own bookkeeping (tensor bindings, layer tables, prompt and token buffers) is not in
+ * `total_bytes`; for a 0.6B model it stays under 64 KiB.
+ *
+ * The byte counts are read as `u64` and returned as numbers. Every count here is a resident byte
+ * count of a single model, so it is far below `Number.MAX_SAFE_INTEGER`; a model that large could
+ * not be resident in a 32-bit address space at all.
+ */
+export const MODEL_REQUIREMENTS_BYTES = 48;
+export const MODEL_REQUIREMENTS_OFFSET = {
+  weight_bytes: 0,
+  cache_bytes: 8,
+  scratch_bytes: 16,
+  total_bytes: 24,
+  max_positions: 32,
+  max_audio_frames: 36,
+  max_decode_tokens: 40,
+  reserved: 44,
+} as const;
+
+export interface ModelRequirements {
+  readonly weight_bytes: number;
+  readonly cache_bytes: number;
+  readonly scratch_bytes: number;
+  readonly total_bytes: number;
+  readonly max_positions: number;
+  readonly max_audio_frames: number;
+  readonly max_decode_tokens: number;
+  readonly reserved: number;
+}
+
+export function readModelRequirements(view: DataView, offset = 0): ModelRequirements {
+  return {
+    weight_bytes: Number(view.getBigUint64(offset + MODEL_REQUIREMENTS_OFFSET.weight_bytes, true)),
+    cache_bytes: Number(view.getBigUint64(offset + MODEL_REQUIREMENTS_OFFSET.cache_bytes, true)),
+    scratch_bytes: Number(
+      view.getBigUint64(offset + MODEL_REQUIREMENTS_OFFSET.scratch_bytes, true),
+    ),
+    total_bytes: Number(view.getBigUint64(offset + MODEL_REQUIREMENTS_OFFSET.total_bytes, true)),
+    max_positions: view.getUint32(offset + MODEL_REQUIREMENTS_OFFSET.max_positions, true),
+    max_audio_frames: view.getUint32(offset + MODEL_REQUIREMENTS_OFFSET.max_audio_frames, true),
+    max_decode_tokens: view.getUint32(offset + MODEL_REQUIREMENTS_OFFSET.max_decode_tokens, true),
+    reserved: view.getUint32(offset + MODEL_REQUIREMENTS_OFFSET.reserved, true),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Model directory format
+// ---------------------------------------------------------------------------
+
+/** Exact size of a `config.bin` (`model_config.size_bytes`); the runtime refuses anything else. */
+export const MODEL_CONFIG_BYTES = 160;
+
+/**
+ * Alignment every shard buffer must have.
+ *
+ * `container.File.parse` hands out tensor views that alias the caller's buffer, so the buffer has to
+ * start on a 16-byte boundary: `qw_alloc(size, SHARD_ALIGNMENT)`.
+ */
+export const SHARD_ALIGNMENT = 16;
+
+/** Every shard file ends in this, which is how a directory's shards are recognized. */
+export const SHARD_SUFFIX = ".qw";

@@ -19,16 +19,20 @@ import {
   isQwenscriberError,
 } from "../errors.ts";
 import type { MelPayload, PreprocessProgress, WasmVersions } from "../types.ts";
+import type { ModelLoadProgress, Transcript, WasmModelInfo } from "../decode.ts";
 import type { SelfTestReport } from "../wasm/runtime.ts";
 
 /**
- * Bumped whenever a message shape changes.
+ * Bumped whenever a message shape changes, or a request is added that a previously shipped worker
+ * cannot serve.
  *
  * The main thread and the worker are compiled together, so a mismatch means a stale worker script
  * was fetched (a cached `inference.worker.js` next to a newer SDK). The worker refuses to run
- * against a version it does not know rather than misreading fields.
+ * against a version it does not know rather than misreading fields or answering a request kind it
+ * has never heard of; version 2 added the model family (`loadModel`, `decode`, `unloadModel`) and
+ * the `modelProgress` response.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Where the worker gets the core from: a URL it fetches, or bytes handed to it by transfer. */
 export type WorkerWasmSource = { readonly url: string } | { readonly bytes: ArrayBuffer };
@@ -52,6 +56,36 @@ export interface TranscribeRequest {
   readonly id: number;
   readonly pcm: ArrayBuffer;
   readonly sampleRateHz: number;
+}
+
+/**
+ * Loads a converted model directory, which the worker fetches itself.
+ *
+ * The worker owns a linear memory that can hold one model at a time, so the directory is named by
+ * URL rather than transferred: pushing 426 MB through `postMessage` would copy every shard, while a
+ * `fetch` inside the worker lands in exactly one buffer -- the one the runtime borrows.
+ */
+export interface LoadModelRequest {
+  readonly kind: "loadModel";
+  readonly id: number;
+  /** Directory holding `manifest.json`, `config.bin`, `tokens.bin`, and the `.qw` shards. */
+  readonly modelUrl: string;
+}
+
+/** Decodes one utterance from log-mel features the main thread already computed. */
+export interface DecodeRequest {
+  readonly kind: "decode";
+  readonly id: number;
+  /** `[mel_bin][frame]` row major, `128 * frames` values. Transferred, not copied. */
+  readonly features: Float32Array;
+  /** Generation budget; the model's own configuration caps it. */
+  readonly maxTokens?: number | undefined;
+}
+
+/** Releases the model, leaving the runtime, its tokenizer, and its front end in place. */
+export interface UnloadModelRequest {
+  readonly kind: "unloadModel";
+  readonly id: number;
 }
 
 export interface SelfTestRequest {
@@ -80,6 +114,9 @@ export type WorkerRequest =
   | InitRequest
   | PreprocessRequest
   | TranscribeRequest
+  | LoadModelRequest
+  | DecodeRequest
+  | UnloadModelRequest
   | SelfTestRequest
   | SetVocabularyRequest
   | DetokenizeRequest
@@ -102,6 +139,24 @@ export interface ProgressResponse {
   readonly kind: "progress";
   readonly id: number;
   readonly progress: PreprocessProgress;
+}
+
+/** One report from a model load, forwarded as it happens rather than after the whole directory. */
+export interface ModelProgressResponse {
+  readonly kind: "modelProgress";
+  readonly id: number;
+  readonly progress: ModelLoadProgress;
+}
+
+export interface ModelResponse {
+  readonly kind: "model";
+  readonly id: number;
+  readonly model: WasmModelInfo;
+}
+
+export interface TranscriptResponse extends Transcript {
+  readonly kind: "transcript";
+  readonly id: number;
 }
 
 export interface MelResponse {
@@ -145,7 +200,10 @@ export type WorkerResponse =
   | ReadyResponse
   | OkResponse
   | ProgressResponse
+  | ModelProgressResponse
   | MelResponse
+  | ModelResponse
+  | TranscriptResponse
   | SelfTestResponse
   | TextResponse
   | ErrorResponse;
@@ -154,6 +212,9 @@ const REQUEST_KINDS: readonly string[] = [
   "init",
   "preprocess",
   "transcribe",
+  "loadModel",
+  "decode",
+  "unloadModel",
   "selfTest",
   "setVocabulary",
   "detokenize",
@@ -164,7 +225,10 @@ const RESPONSE_KINDS: readonly string[] = [
   "ready",
   "ok",
   "progress",
+  "modelProgress",
   "mel",
+  "model",
+  "transcript",
   "selfTest",
   "text",
   "error",
@@ -208,6 +272,7 @@ export function asWorkerResponse(value: unknown): WorkerResponse {
 export function requestTransferables(request: WorkerRequest): Transferable[] {
   if (request.kind === "preprocess") return [request.pcm];
   if (request.kind === "transcribe") return [request.pcm];
+  if (request.kind === "decode") return [request.features.buffer as ArrayBuffer];
   if (request.kind === "detokenize") return [request.ids.buffer as ArrayBuffer];
   return [];
 }
@@ -215,6 +280,7 @@ export function requestTransferables(request: WorkerRequest): Transferable[] {
 /** Buffers a response moves rather than shares. */
 export function responseTransferables(response: WorkerResponse): Transferable[] {
   if (response.kind === "mel") return [response.payload.features.buffer as ArrayBuffer];
+  if (response.kind === "transcript") return [response.tokens.buffer as ArrayBuffer];
   return [];
 }
 

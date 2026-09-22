@@ -3,10 +3,24 @@
 //! Used when `Worker` is unavailable (Node, an environment without workers) or when the caller asks
 //! for `worker: false`. It runs the identical sequence -- resample, then log-mel -- so a result does
 //! not depend on which channel produced it; only where the work happens differs.
+//!
+//! It implements the model family too, so the same code drives a model whether or not a worker is
+//! available: `loadModel` reads the directory from wherever `fetch` can reach it (a Node caller can
+//! pass its own `ModelDirectory` instead), and decode runs the ABI in this thread.
 
-import { MEL_SAMPLE_RATE_HZ } from "./wasm/abi.ts";
-import { NotImplementedError } from "./errors.ts";
+import { MEL_SAMPLE_RATE_HZ, STATUS } from "./wasm/abi.ts";
+import { NotImplementedError, QwenscriberError } from "./errors.ts";
 import { WasmCore, type SelfTestReport, type WasmSource } from "./wasm/runtime.ts";
+import {
+  fetchModelDirectory,
+  loadModel,
+  type LoadModelOptions,
+  type ModelChannel,
+  type ModelDirectory,
+  type Transcript,
+  type WasmModel,
+  type WasmModelInfo,
+} from "./decode.ts";
 import { resample } from "./audio/resample.ts";
 import type {
   MelPayload,
@@ -15,12 +29,13 @@ import type {
   WasmVersions,
 } from "./types.ts";
 
-export class InlineChannel implements RuntimeChannel {
+export class InlineChannel implements RuntimeChannel, ModelChannel {
   readonly versions: WasmVersions;
   /** See `RuntimeChannel.progress`. */
   progress: ((progress: PreprocessProgress) => void) | undefined;
 
   private readonly core: WasmCore;
+  private model: WasmModel | undefined;
 
   private constructor(core: WasmCore) {
     this.core = core;
@@ -65,8 +80,8 @@ export class InlineChannel implements RuntimeChannel {
     const payload = await this.preprocess(pcm, sampleRateHz);
     throw new NotImplementedError("decode", "transcribe", {
       message:
-        "transcribe needs the encoder and decode stages, which ABI v1 does not expose: the mel " +
-        "front end ran, and there is nothing that can turn features into tokens yet.",
+        "transcribe ran the log-mel front end, and this channel holds no model to decode with: " +
+        "load a converted model directory with this channel's loadModel, then decode its features.",
       context: {
         frames: payload.frames,
         padding_value: payload.paddingValue,
@@ -88,7 +103,46 @@ export class InlineChannel implements RuntimeChannel {
     return this.core.detokenize(ids);
   }
 
+  /**
+   * Loads a converted model directory into this thread's core.
+   *
+   * A URL or path is fetched through `fetchModelDirectory`; a `ModelDirectory` is used as it is,
+   * which is how a Node caller reads a directory from disk without an HTTP server.
+   */
+  async loadModel(
+    source: string | URL | ModelDirectory,
+    options: LoadModelOptions = {},
+  ): Promise<WasmModelInfo> {
+    this.model?.dispose();
+    this.model = undefined;
+    const directory =
+      typeof source === "string" || source instanceof URL ? fetchModelDirectory(source) : source;
+    const loaded = await loadModel(this.core, directory, options);
+    this.model = loaded;
+    return {
+      modelId: loaded.modelId,
+      quantization: loaded.manifest.quantization,
+      source: directory.source,
+      requirements: loaded.requirements,
+    };
+  }
+
+  async decode(features: Float32Array, maxTokens?: number): Promise<Transcript> {
+    if (this.model === undefined) {
+      throw new QwenscriberError(STATUS.invalid_state, "decode", {
+        message: "this channel holds no model; call loadModel first",
+      });
+    }
+    return this.model.decode(features, { maxTokens });
+  }
+
+  async unloadModel(): Promise<void> {
+    this.model?.dispose();
+    this.model = undefined;
+  }
+
   async dispose(): Promise<void> {
+    await this.unloadModel();
     this.core.dispose();
   }
 }

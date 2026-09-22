@@ -9,6 +9,11 @@ packages/*/dist/
 
 # Model checkpoints and converted weights: never committed.
 models/*/
+# Reference stage dumps from tools/reference/transcribe_reference.py: they are
+# regenerated, they are large, and the small fixtures the tests need are tracked
+# separately as mel_*.f32.
+tests/fixtures/reference/
+tests/fixtures/reference.new/
 !models/README.md
 artifacts/
 *.safetensors

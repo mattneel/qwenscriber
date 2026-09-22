@@ -20,6 +20,13 @@ import {
   type WorkerWasmSource,
 } from "./protocol.ts";
 import type { MelPayload, PreprocessProgress, RuntimeChannel, WasmVersions } from "../types.ts";
+import type {
+  LoadModelOptions,
+  ModelChannel,
+  ModelLoadProgress,
+  Transcript,
+  WasmModelInfo,
+} from "../decode.ts";
 import type { SelfTestReport } from "../wasm/runtime.ts";
 
 /** Requests allowed in flight before new ones are refused. A bound, not a queue. */
@@ -35,13 +42,15 @@ export interface WorkerChannelOptions {
   readonly wasm: WorkerWasmSource;
 }
 
-export class WorkerChannel implements RuntimeChannel {
+export class WorkerChannel implements RuntimeChannel, ModelChannel {
   private readonly worker: Worker;
   private readonly inFlight = new Map<number, InFlight>();
   private versionsValue: WasmVersions | undefined;
   private nextIdValue = 1;
   private disposedValue = false;
   private disposal: Promise<void> | undefined;
+  /** Receives progress for the model load in flight; there can only be one. */
+  private modelProgress: ((progress: ModelLoadProgress) => void) | undefined;
   /** See `RuntimeChannel.progress`. */
   progress: ((progress: PreprocessProgress) => void) | undefined;
 
@@ -131,6 +140,48 @@ export class WorkerChannel implements RuntimeChannel {
       message: `the worker answered transcribe with ${response.kind} instead of an error`,
       context: { response_kind: response.kind },
     });
+  }
+
+  /**
+   * Loads a converted model directory, which the worker fetches itself.
+   *
+   * Only the URL crosses the boundary: a model is hundreds of megabytes, and transferring that
+   * through `postMessage` would copy every shard twice. `options.onProgress` receives one report per
+   * file as the worker reads it.
+   */
+  async loadModel(
+    modelUrl: string | URL,
+    options: LoadModelOptions = {},
+  ): Promise<WasmModelInfo> {
+    const url = typeof modelUrl === "string" ? modelUrl : modelUrl.href;
+    this.modelProgress = options.onProgress;
+    try {
+      const response = await this.expect(
+        "model",
+        { kind: "loadModel", id: this.takeId(), modelUrl: url },
+        [],
+      );
+      return response.model;
+    } finally {
+      this.modelProgress = undefined;
+    }
+  }
+
+  /**
+   * Decodes one utterance. The features are transferred, so the caller's array is detached by the
+   * time this resolves -- they came from `preprocess`, which hands back a fresh copy each call.
+   */
+  async decode(features: Float32Array, maxTokens?: number): Promise<Transcript> {
+    const response = await this.expect(
+      "transcript",
+      { kind: "decode", id: this.takeId(), features, maxTokens },
+      [features.buffer as ArrayBuffer],
+    );
+    return { tokens: response.tokens, text: response.text };
+  }
+
+  async unloadModel(): Promise<void> {
+    await this.expect("ok", { kind: "unloadModel", id: this.takeId() }, []);
   }
 
   async selfTest(): Promise<SelfTestReport> {
@@ -237,6 +288,10 @@ export class WorkerChannel implements RuntimeChannel {
     }
     if (response.kind === "progress") {
       this.progress?.(response.progress);
+      return;
+    }
+    if (response.kind === "modelProgress") {
+      this.modelProgress?.(response.progress);
       return;
     }
     if (response.id === 0) {

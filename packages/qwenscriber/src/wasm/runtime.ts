@@ -13,21 +13,27 @@ import {
   ALIGNMENT_MAX,
   ABI_MAJOR,
   ABI_VERSION_EXPECTED,
+  FEATURE,
   MEL_BINS,
   MEL_CAPACITY_FRAMES,
   MEL_RESULT_BYTES,
+  MODEL_CONFIG_BYTES,
+  MODEL_REQUIREMENTS_BYTES,
   SELF_TEST_RESULT_BYTES,
+  SHARD_ALIGNMENT,
   STATUS,
   SUPPORTED_ALIGNMENTS,
   TOKENIZER_DESCRIPTOR_BYTES,
   failedSelfTestChecks,
   readMelResult,
+  readModelRequirements,
   readSelfTestResult,
   writeTokenizerDescriptor,
   type Alignment,
+  type ModelRequirements,
   type TokenizerDescriptor,
 } from "./abi.ts";
-import { AbiMismatchError, QwenscriberError, SDK_STATUS, throwForStatus } from "../errors.ts";
+import { AbiMismatchError, NotImplementedError, QwenscriberError, SDK_STATUS, throwForStatus } from "../errors.ts";
 
 /**
  * Everything `WasmCore.load` accepts.
@@ -37,7 +43,7 @@ import { AbiMismatchError, QwenscriberError, SDK_STATUS, throwForStatus } from "
  */
 export type WasmSource = WebAssembly.Module | ArrayBuffer | ArrayBufferView | string | URL;
 
-/** The exports `src/wasm/exports.zig` publishes. A module missing one of these is refused. */
+/** The core exports every ABI v1 module publishes. A module missing one of these is refused. */
 interface CoreExports {
   readonly memory: WebAssembly.Memory;
   qw_abi_version(): number;
@@ -70,6 +76,44 @@ interface CoreExports {
     written_ptr: number,
   ): number;
   qw_selftest(result_ptr: number): number;
+  /** Capability bits, absent from a module built before the model family existed. */
+  qw_features?(): number;
+  qw_model_begin?(handle: number): number;
+  qw_model_add_shard?(handle: number, shard_ptr: number, shard_len: number): number;
+  qw_model_finish?(handle: number, config_ptr: number, config_len: number): number;
+  qw_model_requirements?(handle: number, out_ptr: number): number;
+  qw_decode_begin?(
+    handle: number,
+    features_ptr: number,
+    features_len: number,
+    max_tokens: number,
+  ): number;
+  qw_decode_step?(handle: number, token_out_ptr: number): number;
+  qw_decode_tokens?(handle: number, out_ptr: number, out_capacity_tokens: number): number;
+  qw_decode_end?(handle: number): number;
+}
+
+/** The model family, bound only when the module reports its feature bits. */
+interface ModelExports {
+  qw_model_begin(handle: number): number;
+  qw_model_add_shard(handle: number, shard_ptr: number, shard_len: number): number;
+  qw_model_finish(handle: number, config_ptr: number, config_len: number): number;
+  qw_model_requirements(handle: number, out_ptr: number): number;
+  qw_decode_begin(
+    handle: number,
+    features_ptr: number,
+    features_len: number,
+    max_tokens: number,
+  ): number;
+  qw_decode_step(handle: number, token_out_ptr: number): number;
+  qw_decode_tokens(handle: number, out_ptr: number, out_capacity_tokens: number): number;
+  qw_decode_end(handle: number): number;
+}
+
+/** What `validateExports` produced: the always-present core, and the negotiated model family. */
+interface BoundExports {
+  readonly core: CoreExports;
+  readonly model: ModelExports | undefined;
 }
 
 const TEXT_ENCODER = new TextEncoder();
@@ -120,6 +164,18 @@ function unsupportedAlignment(alignment: number): QwenscriberError {
   });
 }
 
+/**
+ * A table whose first offset is not zero is not a vocabulary: offsets are relative to the start of
+ * the token bytes, so the first one has to be zero. Refusing here is what keeps a table written with
+ * an unexpected prefix from decoding into the middle of every token.
+ */
+function unsupportedTable(headerBytes: number, tokenCount: number, firstOffset: number): never {
+  throw new QwenscriberError(STATUS.invalid_encoding, "qw_tokenizer_set", {
+    message: `the vocabulary table's first offset is ${firstOffset}, not zero`,
+    context: { token_count: tokenCount, header_bytes: headerBytes, first_offset: firstOffset },
+  });
+}
+
 function requireExport(raw: WebAssembly.Exports, name: string): (...args: number[]) => number {
   const value = raw[name];
   if (typeof value !== "function") {
@@ -142,15 +198,40 @@ function requireVoidExport(raw: WebAssembly.Exports, name: string): (...args: nu
   return value as (...args: number[]) => void;
 }
 
+/**
+ * Binds the model and decode family when the module publishes it.
+ *
+ * The family landed after the first ABI v1 modules shipped, so it is negotiated rather than
+ * required: `qw_features` says whether this build has it, and every export is checked for presence
+ * in the same step. A module that reports the bits without the exports is refused, because that
+ * combination means the module is not the one it claims to be.
+ */
+function bindModelFamily(raw: WebAssembly.Exports): ModelExports | undefined {
+  const features = (raw["qw_features"] as (() => number) | undefined)?.() ?? 0;
+  const wanted = (features & (FEATURE.model | FEATURE.decode)) === 
+    (FEATURE.model | FEATURE.decode);
+  if (!wanted) return undefined;
+  return {
+    qw_model_begin: requireExport(raw, "qw_model_begin"),
+    qw_model_add_shard: requireExport(raw, "qw_model_add_shard"),
+    qw_model_finish: requireExport(raw, "qw_model_finish"),
+    qw_model_requirements: requireExport(raw, "qw_model_requirements"),
+    qw_decode_begin: requireExport(raw, "qw_decode_begin"),
+    qw_decode_step: requireExport(raw, "qw_decode_step"),
+    qw_decode_tokens: requireExport(raw, "qw_decode_tokens"),
+    qw_decode_end: requireExport(raw, "qw_decode_end"),
+  };
+}
+
 /** Maps the raw instance exports onto `CoreExports`, refusing a module that is not ABI v1. */
-function validateExports(raw: WebAssembly.Exports): CoreExports {
+function validateExports(raw: WebAssembly.Exports): BoundExports {
   const memory = raw["memory"];
   if (!(memory instanceof WebAssembly.Memory)) {
     throw new QwenscriberError(SDK_STATUS.protocol, "instantiate", {
       message: "the module does not export its linear memory as `memory`",
     });
   }
-  return {
+  const core: CoreExports = {
     memory,
     qw_abi_version: requireExport(raw, "qw_abi_version"),
     qw_core_version: requireExport(raw, "qw_core_version"),
@@ -169,6 +250,9 @@ function validateExports(raw: WebAssembly.Exports): CoreExports {
     qw_detokenize: requireExport(raw, "qw_detokenize"),
     qw_selftest: requireExport(raw, "qw_selftest"),
   };
+  const qw_features = raw["qw_features"];
+  if (typeof qw_features === "function") core.qw_features = qw_features as () => number;
+  return { core, model: bindModelFamily(raw) };
 }
 
 async function fetchModuleBytes(url: string | URL): Promise<Uint8Array<ArrayBuffer>> {
@@ -252,22 +336,27 @@ export class Allocation {
     this.alignment = alignment;
   }
 
+  /** True once `dispose()` has run. A released buffer must not be handed to the runtime. */
+  get disposed(): boolean {
+    return this.released;
+  }
+
   /** A fresh view over the whole buffer. */
   get bytes(): Uint8Array {
     this.assertLive();
     return new Uint8Array(this.core.memoryBuffer(), this.pointer, this.size);
   }
 
-  f32(count: number): Float32Array {
+  f32(count: number, byteOffset = 0): Float32Array {
     this.assertLive();
-    this.assertFits(count * 4);
-    return new Float32Array(this.core.memoryBuffer(), this.pointer, count);
+    this.assertFits(byteOffset + count * 4);
+    return new Float32Array(this.core.memoryBuffer(), this.pointer + byteOffset, count);
   }
 
-  u32(count: number): Uint32Array {
+  u32(count: number, byteOffset = 0): Uint32Array {
     this.assertLive();
-    this.assertFits(count * 4);
-    return new Uint32Array(this.core.memoryBuffer(), this.pointer, count);
+    this.assertFits(byteOffset + count * 4);
+    return new Uint32Array(this.core.memoryBuffer(), this.pointer + byteOffset, count);
   }
 
   dataView(byteLength = this.size, byteOffset = 0): DataView {
@@ -326,6 +415,8 @@ export class Allocation {
 /** One instantiated ABI v1 module with its `qw_create` handle. */
 export class WasmCore {
   private readonly exports: CoreExports;
+  /** The negotiated model family, or `undefined` when this build has none. */
+  private readonly modelFamilyValue: ModelExports | undefined;
   private readonly errorMessages = new Map<number, string>();
   private readonly moduleBytesValue: number;
   private handleValue: number;
@@ -333,8 +424,13 @@ export class WasmCore {
     | { readonly allocations: readonly Allocation[]; readonly idBytes: Uint32Array }
     | undefined;
 
-  private constructor(exports: CoreExports, handle: number, moduleBytes: number) {
-    this.exports = exports;
+  private constructor(
+    bound: BoundExports,
+    handle: number,
+    moduleBytes: number,
+  ) {
+    this.exports = bound.core;
+    this.modelFamilyValue = bound.model;
     this.handleValue = handle;
     this.moduleBytesValue = moduleBytes;
   }
@@ -357,20 +453,20 @@ export class WasmCore {
     } catch (error) {
       throw new QwenscriberError(SDK_STATUS.protocol, "instantiate", {
         message:
-          "instantiation failed; ABI v1 modules must resolve every import themselves " +
-          "(wasm32-freestanding)",
+          "instantiation failed; this build resolves no imports, so a module that needs any was " +
+          "compiled for a different target",
         cause: error,
       });
     }
-    const exports = validateExports(instance.exports);
-    WasmCore.assertAbiVersion(exports.qw_abi_version());
-    const handle = exports.qw_create();
+    const bound = validateExports(instance.exports);
+    WasmCore.assertAbiVersion(bound.core.qw_abi_version());
+    const handle = bound.core.qw_create();
     if (handle === 0) {
       throw new QwenscriberError(SDK_STATUS.protocol, "qw_create", {
         message: "the module already holds a runtime instance; ABI v1 allows exactly one",
       });
     }
-    return new WasmCore(exports, handle, prepared.bytes);
+    return new WasmCore(bound, handle, prepared.bytes);
   }
 
   /**
@@ -403,7 +499,9 @@ export class WasmCore {
 
   /** Current linear memory size in bytes. */
   memoryBytes(): number {
-    return this.exports.qw_memory_bytes();
+    // The export returns `u32`; a wasm result arrives as a signed `i32`, so a
+    // memory past 2 GiB would read back negative. `>>> 0` restores the value.
+    return this.exports.qw_memory_bytes() >>> 0;
   }
 
   /** Compiled module size in bytes, or 0 when the caller passed an already-compiled module. */
@@ -420,8 +518,8 @@ export class WasmCore {
   errorMessage(code: number): string {
     const cached = this.errorMessages.get(code);
     if (cached !== undefined) return cached;
-    const pointer = this.exports.qw_error_message_ptr(code);
-    const length = this.exports.qw_error_message_len(code);
+    const pointer = this.exports.qw_error_message_ptr(code) >>> 0;
+    const length = this.exports.qw_error_message_len(code) >>> 0;
     const text =
       length === 0
         ? ""
@@ -439,7 +537,10 @@ export class WasmCore {
       });
     }
     if (!isSupportedAlignment(alignment)) throw unsupportedAlignment(alignment);
-    const pointer = this.exports.qw_alloc(size, alignment);
+    // `qw_alloc` returns a `u32` offset, and a wasm result arrives in JavaScript as a signed i32:
+    // an allocation above 2 GiB -- which is exactly where a model's weights and cache land --
+    // would otherwise read back negative and be rejected as a failed call.
+    const pointer = this.exports.qw_alloc(size, alignment) >>> 0;
     if (pointer === 0) {
       throw new QwenscriberError(STATUS.out_of_memory, "qw_alloc", {
         message: `qw_alloc could not satisfy ${size} bytes aligned to ${alignment}`,
@@ -646,6 +747,259 @@ export class WasmCore {
     } finally {
       result.dispose();
     }
+  }
+
+  /**
+   * The capability bits this module reports (`qw_features`).
+   *
+   * Zero means the module was built before that export existed, which is how an older ABI v1 build
+   * is told apart from a broken one. Use `FEATURE`/`FEATURE_NAMES` from `abi.ts` to read it.
+   */
+  features(): number {
+    return this.exports.qw_features?.() ?? 0;
+  }
+
+  /**
+   * Allocates the model's own arena.
+   *
+   * Legal when no model is being built and when a previous attempt is still pending: shards can be
+   * added but never removed, so starting over is the only way to retry a load that failed.
+   */
+  modelBegin(): void {
+    const model = this.modelExports("qw_model_begin");
+    this.check(model.qw_model_begin(this.handleValue), "qw_model_begin");
+  }
+
+  /**
+   * Hands the runtime one `.qw` shard.
+   *
+   * The runtime parses the container in place and keeps the view: the weight tensors point into
+   * this buffer, so it stays resident and unmodified until the model is released. Allocate it with
+   * `alloc(size, SHARD_ALIGNMENT)`, which is what `decode.ts` does.
+   */
+  modelAddShard(shard: Allocation): void {
+    const model = this.modelExports("qw_model_add_shard");
+    if (shard.disposed) {
+      throw new QwenscriberError(STATUS.invalid_argument, "qw_model_add_shard", {
+        message: "the shard buffer was released; the runtime keeps the bytes, not a copy",
+        context: { pointer: shard.pointer, size: shard.size },
+      });
+    }
+    if (shard.pointer % SHARD_ALIGNMENT !== 0) {
+      throw new QwenscriberError(STATUS.invalid_argument, "qw_model_add_shard", {
+        message: `a shard buffer must be ${SHARD_ALIGNMENT}-byte aligned`,
+        context: { pointer: shard.pointer, alignment: SHARD_ALIGNMENT },
+      });
+    }
+    this.check(
+      model.qw_model_add_shard(this.handleValue, shard.pointer, shard.size),
+      "qw_model_add_shard",
+      { shard_bytes: shard.size },
+    );
+  }
+
+  /**
+   * Parses `config.bin`, resolves every tensor, and prepares the decoder.
+   *
+   * The configuration is copied into the runtime, so the buffer may be released as soon as this
+   * returns. A failure releases whatever the attempt had allocated and leaves the handle ready to
+   * start over with `modelBegin`.
+   */
+  modelFinish(config: Uint8Array): void {
+    const model = this.modelExports("qw_model_finish");
+    if (config.byteLength !== MODEL_CONFIG_BYTES) {
+      throw new QwenscriberError(STATUS.truncated, "qw_model_finish", {
+        message: `config.bin is exactly ${MODEL_CONFIG_BYTES} bytes, got ${config.byteLength}`,
+        context: { config_bytes: config.byteLength },
+      });
+    }
+    const buffer = this.alloc(MODEL_CONFIG_BYTES, 4);
+    try {
+      buffer.copyFrom(config);
+      this.check(
+        model.qw_model_finish(this.handleValue, buffer.pointer, buffer.size),
+        "qw_model_finish",
+        { config_bytes: buffer.size },
+      );
+    } finally {
+      buffer.dispose();
+    }
+  }
+
+  /**
+   * What the loaded model keeps resident, and the limits it decodes within.
+   *
+   * This is the measurement a caller plans against: `total_bytes` is the weight bytes it must keep
+   * resident plus the runtime's own cache and scratch.
+   */
+  modelRequirements(): ModelRequirements {
+    const model = this.modelExports("qw_model_requirements");
+    const result = this.alloc(MODEL_REQUIREMENTS_BYTES, 8);
+    try {
+      this.check(
+        model.qw_model_requirements(this.handleValue, result.pointer),
+        "qw_model_requirements",
+      );
+      return readModelRequirements(result.dataView(), 0);
+    } finally {
+      result.dispose();
+    }
+  }
+
+  /**
+   * Decodes one utterance: encode the features, prefill the prompt, and generate up to `maxTokens`
+   * ids with `qw_decode_begin`, `qw_decode_step`, and `qw_decode_tokens`.
+   *
+   * `features` is the `[mel_bin][frame]` block `melCompute` returns; it is read during this call and
+   * never retained. The key/value cache is per utterance, so the utterance is ended here -- that is
+   * what keeps the next clip independent of this one -- and the model stays resident for it.
+   *
+   * Returns the produced token ids, ready for `detokenize`.
+   */
+  decodeUtterance(features: Float32Array, maxTokens: number): Uint32Array {
+    const model = this.modelExports("qw_decode_begin");
+    if (features.length === 0) {
+      throw new QwenscriberError(STATUS.invalid_argument, "qw_decode_begin", {
+        message: "decoding needs at least one log-mel frame",
+        context: { frames: 0 },
+      });
+    }
+    if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
+      throw new QwenscriberError(STATUS.invalid_argument, "qw_decode_begin", {
+        message: `max_tokens must be a positive integer, got ${maxTokens}`,
+        context: { max_tokens: maxTokens },
+      });
+    }
+    const input = this.alloc(features.length * Float32Array.BYTES_PER_ELEMENT, 4);
+    const token = this.alloc(Uint32Array.BYTES_PER_ELEMENT, 4);
+    const ids = this.alloc(maxTokens * Uint32Array.BYTES_PER_ELEMENT, 4);
+    try {
+      input.copyFrom(features);
+      this.check(
+        model.qw_decode_begin(this.handleValue, input.pointer, input.size, maxTokens),
+        "qw_decode_begin",
+        { frames: features.length / MEL_BINS, max_tokens: maxTokens },
+      );
+      try {
+        return this.generateTokens(model, token, ids, maxTokens);
+      } finally {
+        this.check(model.qw_decode_end(this.handleValue), "qw_decode_end");
+      }
+    } finally {
+      ids.dispose();
+      token.dispose();
+      input.dispose();
+    }
+  }
+
+  /**
+   * Points the runtime at a vocabulary in the ABI's own table format: `count + 1` little-endian
+   * `u32` offsets followed by the concatenated token bytes, which is what the converter writes to
+   * `tokens.bin`. `count` comes from the directory's manifest.
+   *
+   * The table is copied into linear memory once and kept for the runtime's lifetime. No token is
+   * ever materialized as a JavaScript string, so a 150k-entry vocabulary costs one copy rather than
+   * a string per token.
+   *
+   * A table may also carry the count itself as a leading word. That is indistinguishable from an
+   * offset by size, so the layout is read from the first word: it is either zero, which is what a
+   * table without a prefix starts with, or exactly `count`, which is the prefix. Any other value is
+   * refused, because a table shifted by one word would decode every token into the middle of its
+   * neighbour rather than fail.
+   */
+  setVocabularyFromTable(table: Uint8Array, tokenCount: number): void {
+    if (!Number.isInteger(tokenCount) || tokenCount <= 0 || tokenCount > VOCABULARY_TOKENS_MAX) {
+      throw new QwenscriberError(STATUS.invalid_argument, "qw_tokenizer_set", {
+        message: `a vocabulary holds 1 to ${VOCABULARY_TOKENS_MAX} tokens, got ${tokenCount}`,
+        context: { token_count: tokenCount },
+      });
+    }
+    const offsetsBytes = (tokenCount + 1) * Uint32Array.BYTES_PER_ELEMENT;
+    const header_bytes = table.byteLength >= Uint32Array.BYTES_PER_ELEMENT &&
+        new DataView(table.buffer, table.byteOffset, table.byteLength).getUint32(0, true) ===
+          tokenCount
+      ? Uint32Array.BYTES_PER_ELEMENT
+      : 0;
+    if (table.byteLength <= header_bytes + offsetsBytes) {
+      throw new QwenscriberError(STATUS.truncated, "qw_tokenizer_set", {
+        message:
+          `a ${tokenCount}-token table takes more than ${offsetsBytes} bytes of offsets, and the ` +
+          `table is ${table.byteLength} bytes`,
+        context: { token_count: tokenCount, table_bytes: table.byteLength },
+      });
+    }
+    // One allocation holds both parts: the offsets array is 4-byte aligned at its own offset, and
+    // the token bytes need no alignment at all.
+    const bytes = this.alloc(table.byteLength, 4);
+    const descriptor_buffer = this.alloc(TOKENIZER_DESCRIPTOR_BYTES, 4);
+    const fresh: readonly Allocation[] = [bytes, descriptor_buffer];
+    try {
+      bytes.copyFrom(table);
+      // The offsets are checked before the runtime sees the table: a shifted table would otherwise
+      // be reported as a malformed vocabulary without saying which word is wrong.
+      const offsets = bytes.u32(tokenCount + 1, header_bytes);
+      const first_offset = offsets[0] ?? 0;
+      if (first_offset !== 0) unsupportedTable(header_bytes, tokenCount, first_offset);
+      const layout: TokenizerDescriptor = {
+        offsets_ptr: bytes.pointer + header_bytes,
+        offsets_len: offsetsBytes,
+        bytes_ptr: bytes.pointer + header_bytes + offsetsBytes,
+        bytes_len: bytes.size - header_bytes - offsetsBytes,
+        token_count: tokenCount,
+        reserved: 0,
+      };
+      writeTokenizerDescriptor(descriptor_buffer.dataView(), 0, layout);
+      this.check(
+        this.exports.qw_tokenizer_set(this.handleValue, descriptor_buffer.pointer),
+        "qw_tokenizer_set",
+        { token_count: tokenCount, bytes_len: layout.bytes_len },
+      );
+      // Byte length per id, so `detokenize` can size its output without asking the module twice.
+      const id_bytes = new Uint32Array(tokenCount);
+      for (let id = 0; id < tokenCount; id += 1) {
+        id_bytes[id] = (offsets[id + 1] ?? 0) - (offsets[id] ?? 0);
+      }
+      // Accepted: the runtime now reads this memory, so only now may the previous vocabulary go.
+      this.releaseVocabulary();
+      this.vocabulary = { allocations: fresh, idBytes: id_bytes };
+    } catch (error) {
+      for (const allocation of fresh) allocation.dispose();
+      throw error;
+    }
+  }
+
+  /**
+   * The model family, or a typed `not_implemented` naming the stage this build cannot run.
+   *
+   * The family is negotiated rather than assumed: a module built before it existed still loads and
+   * still preprocesses, and asking for a stage it does not have says exactly that.
+   */
+  private modelExports(operation: string): ModelExports {
+    const family = this.modelFamilyValue;
+    if (family !== undefined) return family;
+    const features = this.features();
+    const missing = (features & FEATURE.model) === 0 ? "model_load" : "decode";
+    throw new NotImplementedError(missing, operation, {
+      context: { features },
+    });
+  }
+
+  /** The greedy loop: step until the sequence ends, then copy the ids out. */
+  private generateTokens(
+    model: ModelExports,
+    token: Allocation,
+    ids: Allocation,
+    maxTokens: number,
+  ): Uint32Array {
+    // Bounded by `maxTokens`: every iteration either produces a token or ends the sequence.
+    for (let step = 0; step < maxTokens; step += 1) {
+      const status = model.qw_decode_step(this.handleValue, token.pointer);
+      if (status === 0) break;
+      if (status !== 1) this.check(status, "qw_decode_step", { step, max_tokens: maxTokens });
+    }
+    const count = model.qw_decode_tokens(this.handleValue, ids.pointer, maxTokens);
+    if (count < 0) this.check(count, "qw_decode_tokens", { capacity_tokens: maxTokens });
+    return ids.u32(count).slice();
   }
 
   /** Releases the vocabulary buffers the runtime is still pointing at. */

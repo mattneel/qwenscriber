@@ -5,6 +5,12 @@
 //! or never settles -- comes back as `available: false` with a `reason` string that says which one
 //! happened. A caller can print the reason; it cannot print a rejected promise.
 //!
+//! Adapters are asked for twice, high-performance first. A machine with a discrete GPU and an
+//! integrated one answers the no-argument request with whichever the browser prefers, which is
+//! routinely the integrated part, and a page that asked once cannot tell afterwards that it asked
+//! for the wrong thing. `adapterRequest` in the report records which attempt succeeded, so "why is
+//! my discrete GPU idle" is a question the page answers about itself.
+//!
 //! Nothing here touches globals directly: `globalThis` is read through a record-style lookup, so the
 //! module behaves identically in a window, a worker, and Node.
 
@@ -53,6 +59,20 @@ export interface WebGpuLimits {
   readonly maxStorageBufferBindingSize: number;
   readonly maxComputeWorkgroupStorageSize: number;
   readonly maxComputeInvocationsPerWorkgroup: number;
+  /**
+   * `minStorageBufferOffsetAlignment`: every binding offset is a multiple of this.
+   *
+   * Measured, or the WebGPU default of 256 when an adapter does not report it, because an upload
+   * planner that assumed 1 would produce offsets the browser rejects.
+   */
+  readonly minStorageBufferOffsetAlignment: number;
+  /**
+   * `maxUniformBufferBindingSize`.
+   *
+   * Measured, or the WebGPU default of 65536 when an adapter does not report it. Every uniform block
+   * here is 16 or 32 bytes, so this limit exists to be *reported*, not to be approached.
+   */
+  readonly maxUniformBufferBindingSize: number;
 }
 
 export interface WebGpuAdapterInfo {
@@ -68,7 +88,25 @@ export interface WebGpuCapability {
   readonly available: boolean;
   /** `"software"` covers SwiftShader, llvmpipe, and WARP: usable, but not a benchmark target. */
   readonly adapter?: "hardware" | "software" | undefined;
+  /**
+   * Which request produced the adapter.
+   *
+   * `"high-performance"` is the one that asks for a discrete GPU; `"default"` means the adapter came
+   * from the fallback request, which is worth knowing when the machine has two GPUs. Absent when
+   * there is no adapter at all.
+   */
+  readonly adapterRequest?: "high-performance" | "default" | undefined;
   readonly adapterInfo?: WebGpuAdapterInfo | undefined;
+  /**
+   * The identity the *other* request answered with, when it was a different adapter.
+   *
+   * A page can only ever see the adapters the browser offers it, and on a machine with two GPUs the
+   * two requests may answer with different ones. When they do, this is the only way the page can
+   * show the second GPU at all -- which is what makes "my discrete GPU is idle" answerable rather
+   * than mysterious. Absent when both requests produced the same adapter (the common case) or when
+   * only one of them produced anything.
+   */
+  readonly alternativeAdapterInfo?: WebGpuAdapterInfo | undefined;
   readonly limits?: WebGpuLimits | undefined;
   /** Why WebGPU is unavailable. Absent when `available` is true. */
   readonly reason?: string | undefined;
@@ -113,6 +151,8 @@ function adapterLimitsOf(adapter: unknown): WebGpuLimits | undefined {
   const max_binding_size = field(limits, "maxStorageBufferBindingSize");
   const max_workgroup_storage = field(limits, "maxComputeWorkgroupStorageSize");
   const max_invocations = field(limits, "maxComputeInvocationsPerWorkgroup");
+  const offset_alignment = field(limits, "minStorageBufferOffsetAlignment");
+  const uniform_binding = field(limits, "maxUniformBufferBindingSize");
   return {
     maxBufferSize: max_buffer_size,
     maxStorageBufferBindingSize:
@@ -121,6 +161,12 @@ function adapterLimitsOf(adapter: unknown): WebGpuLimits | undefined {
       typeof max_workgroup_storage === "number" ? max_workgroup_storage : 0,
     maxComputeInvocationsPerWorkgroup:
       typeof max_invocations === "number" ? max_invocations : 0,
+    // The WebGPU default rather than 0: an off-by-default here would plan unaligned uploads, which
+    // is a failure the browser reports far away from the number that caused it.
+    minStorageBufferOffsetAlignment:
+      typeof offset_alignment === "number" && offset_alignment >= 1 ? offset_alignment : 256,
+    maxUniformBufferBindingSize:
+      typeof uniform_binding === "number" && uniform_binding >= 1 ? uniform_binding : 65536,
   };
 }
 
@@ -167,6 +213,117 @@ async function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promi
 }
 
 /**
+ * The two adapter requests, in the order that finds a discrete GPU first.
+ *
+ * The arguments are written out per attempt rather than derived, because
+ * `{ powerPreference: "high-performance" }` is the whole point of the first one and inlining it
+ * here is what makes that visible.
+ */
+const ADAPTER_REQUESTS = [
+  { preference: "high-performance", options: { powerPreference: "high-performance" } },
+  { preference: "default", options: undefined },
+] as const;
+
+/** An adapter plus the report describing it. `adapter` is present exactly when `available` is true. */
+export interface AdapterAcquisition {
+  readonly capability: WebGpuCapability;
+  readonly adapter?: unknown;
+}
+
+/** True when two adapter identities describe the same GPU, so the report can skip the duplicate. */
+function sameAdapter(
+  left: WebGpuAdapterInfo | undefined,
+  right: WebGpuAdapterInfo | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return true;
+  return (
+    left.vendor === right.vendor &&
+    left.architecture === right.architecture &&
+    left.device === right.device &&
+    left.description === right.description &&
+    (left.isFallbackAdapter ?? false) === (right.isFallbackAdapter ?? false)
+  );
+}
+
+/**
+ * Asks for an adapter, high-performance first, and describes what came back.
+ *
+ * Both requests are made, not just the first one that succeeds: an adapter the page cannot see is an
+ * adapter it cannot report, and on a two-GPU machine the two requests may be answered by different
+ * parts. The high-performance answer wins; the other one is kept only as `alternativeAdapterInfo`,
+ * and only when it is genuinely a different GPU.
+ *
+ * The probe's own reason strings are produced here, so a failed acquisition and a failed probe
+ * explain themselves with the same words. The caller that needs the adapter object (to request a
+ * device) reads `adapter`; the caller that only needs to know whether there is a GPU reads
+ * `capability`.
+ */
+export async function acquireAdapter(
+  gpu: unknown,
+  timeoutMs: number = WEBGPU_PROBE_TIMEOUT_MS,
+): Promise<AdapterAcquisition> {
+  const request_adapter = field(gpu, "requestAdapter");
+  if (typeof request_adapter !== "function") {
+    return {
+      capability: {
+        available: false,
+        reason: "navigator.gpu is unavailable: the browser has no WebGPU entry point",
+      },
+    };
+  }
+
+  let failure: string | undefined;
+  const answered: { preference: "high-performance" | "default"; adapter: unknown }[] = [];
+  for (const request of ADAPTER_REQUESTS) {
+    let adapter: unknown;
+    try {
+      const call = request.options === undefined
+        ? (request_adapter as () => Promise<unknown>).call(gpu)
+        : (request_adapter as (options: unknown) => Promise<unknown>).call(gpu, request.options);
+      adapter = await settleWithin(call as Promise<unknown>, timeoutMs);
+    } catch (error) {
+      failure =
+        `requestAdapter(${request.preference}) failed: ` +
+        `${error instanceof Error ? error.message : String(error)}`;
+      continue;
+    }
+    if (adapter === undefined) {
+      failure = `requestAdapter(${request.preference}) did not settle within ${timeoutMs} ms`;
+      continue;
+    }
+    if (adapter === null) {
+      failure = "requestAdapter() returned null: no compatible adapter, or WebGPU is disabled";
+      continue;
+    }
+    answered.push({ preference: request.preference, adapter });
+  }
+
+  const preferred = answered.find((entry) => entry.preference === "high-performance") ?? answered[0];
+  if (preferred === undefined) {
+    return {
+      capability: {
+        available: false,
+        reason: failure ?? "requestAdapter() returned no adapter and gave no reason",
+      },
+    };
+  }
+  const info = adapterInfoOf(preferred.adapter);
+  const other = answered.length > 1 && preferred === answered[0] ? answered[1] : undefined;
+  const other_info = other === undefined ? undefined : adapterInfoOf(other.adapter);
+  return {
+    adapter: preferred.adapter,
+    capability: {
+      available: true,
+      adapter: adapterKindOf(preferred.adapter, info),
+      adapterRequest: preferred.preference,
+      adapterInfo: info,
+      ...(sameAdapter(info, other_info) ? {} : { alternativeAdapterInfo: other_info }),
+      limits: adapterLimitsOf(preferred.adapter),
+    },
+  };
+}
+
+/**
  * Probes a `navigator.gpu`-shaped object.
  *
  * Exported as a seam: it takes the object rather than reaching for a global, so it can be exercised
@@ -177,44 +334,22 @@ export async function probeWebGpu(
   gpu: unknown,
   timeoutMs: number = WEBGPU_PROBE_TIMEOUT_MS,
 ): Promise<WebGpuCapability> {
-  const request_adapter = field(gpu, "requestAdapter");
-  if (typeof request_adapter !== "function") {
-    return {
-      available: false,
-      reason: "navigator.gpu is unavailable: the browser has no WebGPU entry point",
-    };
-  }
-  let adapter: unknown;
-  try {
-    const pending = (request_adapter as () => Promise<unknown>).call(gpu) as Promise<unknown>;
-    adapter = await settleWithin(pending, timeoutMs);
-  } catch (error) {
-    return {
-      available: false,
-      reason: `requestAdapter() failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-  if (adapter === undefined) {
-    return { available: false, reason: `requestAdapter() did not settle within ${timeoutMs} ms` };
-  }
-  if (adapter === null) {
-    return {
-      available: false,
-      reason: "requestAdapter() returned null: no compatible adapter, or WebGPU is disabled",
-    };
-  }
-  const info = adapterInfoOf(adapter);
-  return {
-    available: true,
-    adapter: adapterKindOf(adapter, info),
-    adapterInfo: info,
-    limits: adapterLimitsOf(adapter),
-  };
+  return (await acquireAdapter(gpu, timeoutMs)).capability;
 }
 
 /** Reads globalThis as a record, so no probe depends on a window, a document, or a DOM type. */
 function globalField(key: string): unknown {
   return (globalThis as unknown as Record<string, unknown>)[key];
+}
+
+/**
+ * `navigator.gpu`, or `undefined` where there is no navigator at all.
+ *
+ * Exported because the runtime needs the same entry point the probe used, and reaching for it a
+ * second way -- a cast here, a lookup there -- is how the two drift apart.
+ */
+export function gpuEntryPoint(): unknown {
+  return field(globalField("navigator"), "gpu");
 }
 
 /**
@@ -227,7 +362,7 @@ export async function capabilities(): Promise<Capabilities> {
   const cross_origin_isolated = globalField("crossOriginIsolated") === true;
   const shared_array_buffer = typeof SharedArrayBuffer === "function";
   const wasm_threads = shared_array_buffer && validateInlineModule(THREADS_PROBE_MODULE);
-  const webgpu = await probeWebGpu(field(globalField("navigator"), "gpu"));
+  const webgpu = await probeWebGpu(gpuEntryPoint());
   return {
     webgpu,
     wasmSimd: validateInlineModule(SIMD_PROBE_MODULE),

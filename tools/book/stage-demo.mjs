@@ -13,7 +13,7 @@
 //     node tools/book/stage-demo.mjs
 //     mdbook build docs
 
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,10 +55,14 @@ async function main() {
   await stageDriver();
   await cp(join(root, "packages/qwenscriber/dist"), join(staged, "sdk"), { recursive: true });
   await cp(join(root, "gpu/shaders"), join(staged, "shaders"), { recursive: true });
-  await cp(join(root, "tests/gpu"), join(staged, "tests"), {
-    recursive: true,
-    filter: (path) => path.endsWith(".mjs"),
-  });
+  // Only the two modules the page imports: `harness.mjs` (which imports
+  // `reference.mjs`), and nothing else from the harness directory. Listed
+  // explicitly because `cp`'s filter is applied to directories too, and rejecting
+  // one skips its whole subtree — which is how an earlier version of this script
+  // silently produced a demo whose imports 404'd.
+  await mkdir(join(staged, "tests"), { recursive: true });
+  await cp(join(root, "tests/gpu/reference.mjs"), join(staged, "tests/reference.mjs"));
+  await cp(join(root, "tests/gpu/harness.mjs"), join(staged, "tests/harness.mjs"));
 
   const module = await readFile(join(staged, "sdk/index.js"), "utf8");
   if (!module.includes("SDK_VERSION")) {
@@ -67,7 +71,32 @@ async function main() {
         "Run `npm run build` in packages/qwenscriber first.",
     );
   }
-  console.log(`staged the browser demo into ${staged}`);
+
+  // Everything the page imports, checked as a set. A staging step that copies
+  // nothing is indistinguishable from one that copies everything until a reader
+  // opens the page, so the check is here rather than in a browser console.
+  const required = [
+    "index.html",
+    "main.js",
+    "sdk/index.js",
+    "sdk/qwenscriber_core.wasm",
+    "shaders/quant_layout.wgsl",
+    "shaders/matmul_q4.wgsl",
+    "tests/reference.mjs",
+    "tests/harness.mjs",
+  ];
+  const missing = [];
+  for (const relative of required) {
+    try {
+      await access(join(staged, relative));
+    } catch {
+      missing.push(relative);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(`tools/book/stage-demo.mjs: staged demo is incomplete: ${missing.join(", ")}`);
+  }
+  console.log(`staged the browser demo into ${staged} (${required.length} required files present)`);
 }
 
 await main();

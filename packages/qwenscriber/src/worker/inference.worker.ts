@@ -12,6 +12,7 @@
 import { MEL_SAMPLE_RATE_HZ, STATUS } from "../wasm/abi.ts";
 import { NotImplementedError, QwenscriberError, SDK_STATUS } from "../errors.ts";
 import { resample } from "../audio/resample.ts";
+import { fetchModelDirectory, loadModel, type WasmModel } from "../decode.ts";
 import { WasmCore } from "../wasm/runtime.ts";
 import {
   PROTOCOL_VERSION,
@@ -20,6 +21,7 @@ import {
   responseTransferables,
   type DisposeRequest,
   type InitRequest,
+  type LoadModelRequest,
   type TranscribeRequest,
   type WorkerRequest,
   type WorkerResponse,
@@ -36,6 +38,7 @@ interface WorkerScope {
 const scope = globalThis as unknown as WorkerScope;
 
 let core: WasmCore | undefined;
+let model: WasmModel | undefined;
 let queue: Promise<void> = Promise.resolve();
 
 scope.addEventListener("message", (event) => {
@@ -84,6 +87,24 @@ async function dispatch(request: WorkerRequest): Promise<void> {
     transcribe(active, request);
     return;
   }
+  if (request.kind === "loadModel") {
+    await loadModelRequest(active, request);
+    return;
+  }
+  if (request.kind === "decode") {
+    const loaded = requireModel();
+    const decoded = loaded.decode(request.features, { maxTokens: request.maxTokens });
+    post({ kind: "transcript", id: request.id, tokens: decoded.tokens, text: decoded.text });
+    return;
+  }
+  if (request.kind === "unloadModel") {
+    // Releasing the model frees the shard buffers and the runtime's own arena; the front end, the
+    // tokenizer, and the self-test stay usable.
+    model?.dispose();
+    model = undefined;
+    post({ kind: "ok", id: request.id });
+    return;
+  }
   if (request.kind === "selfTest") {
     post({ kind: "selfTest", id: request.id, report: active.selfTest() });
     return;
@@ -104,6 +125,46 @@ function requireCore(): WasmCore {
     });
   }
   return core;
+}
+
+function requireModel(): WasmModel {
+  if (model === undefined) {
+    throw new QwenscriberError(STATUS.invalid_state, "decode", {
+      message: "the worker holds no model; send a loadModel request first",
+      context: { worker_state: "no-model" },
+    });
+  }
+  return model;
+}
+
+/**
+ * Loads a converted model directory into the worker's linear memory.
+ *
+ * The worker fetches the directory itself. A model is hundreds of megabytes, and transferring that
+ * through `postMessage` would copy every shard on the way in and again on the way out; a `fetch`
+ * here lands in exactly one buffer, the one the runtime borrows. Progress is reported per file,
+ * because a load that runs for a minute with no output is indistinguishable from a hang.
+ *
+ * A model already in the worker is released first, so switching models is one request rather than a
+ * strict unload-then-load sequence.
+ */
+async function loadModelRequest(active: WasmCore, request: LoadModelRequest): Promise<void> {
+  model?.dispose();
+  model = undefined;
+  const loaded = await loadModel(active, fetchModelDirectory(request.modelUrl), {
+    onProgress: (progress) => post({ kind: "modelProgress", id: request.id, progress }),
+  });
+  model = loaded;
+  post({
+    kind: "model",
+    id: request.id,
+    model: {
+      modelId: loaded.modelId,
+      quantization: loaded.manifest.quantization,
+      source: request.modelUrl,
+      requirements: loaded.requirements,
+    },
+  });
 }
 
 async function initialize(request: InitRequest): Promise<void> {
@@ -182,8 +243,8 @@ function transcribe(active: WasmCore, request: TranscribeRequest): void {
   const payload = preprocess(active, request.pcm, request.sampleRateHz, request.id);
   throw new NotImplementedError("decode", "transcribe", {
     message:
-      "transcribe needs the encoder and decode stages, which ABI v1 does not expose: the mel " +
-      "front end ran, and there is nothing that can turn features into tokens yet.",
+      "transcribe ran the log-mel front end, and this worker holds no model to decode with: " +
+      "send a loadModel request for a converted model directory, then decode its features.",
     context: {
       frames: payload.frames,
       padding_value: payload.paddingValue,
@@ -194,6 +255,8 @@ function transcribe(active: WasmCore, request: TranscribeRequest): void {
 }
 
 function dispose(request: DisposeRequest): void {
+  model?.dispose();
+  model = undefined;
   core?.dispose();
   core = undefined;
   // Acknowledge before closing: `close()` takes effect once this task returns, so the reply is
