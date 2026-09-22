@@ -22,7 +22,7 @@ exact names, layouts, and calling conventions.
 | Version | ABI query, runtime version, supported feature bits |
 | Memory | WASM allocation/free where host-to-linear-memory transfer requires it |
 | Runtime | Create/destroy, limits, diagnostics, scratch planning |
-| Model | Parse/load/release, enumerate tensor descriptors, validate compatibility |
+| Model | Parse/load/release, enumerate tensor descriptors, validate compatibility, report what a model keeps resident and the audio tower's geometry |
 | Audio | Push/convert/resample/preprocess bounded PCM ranges |
 | Decode | Begin/step/end a decode session; inspect bounded token output |
 | Text | Resolve token bytes and assemble validated output |
@@ -37,6 +37,13 @@ A family grows in place where it can. `qw_model_set_cache_format` was added to t
 the family was in use and needed no version bump: a caller that never calls it gets the behavior it
 already had, and the width it chooses is reported back through `qw_model_requirements` rather than
 assumed. It is refused once a model is loaded, because the load is what allocates the cache.
+
+`qw_model_audio_config` joined the same family the same way, and for the same reason: a caller that
+dispatches the audio tower itself needs its geometry, and a caller that does not dispatch the tower
+never asks. It reports `AudioConfig` -- width, layer and head counts, the chunk's frame and step
+counts, the bins left after the convolution stack, the projector width, and the LayerNorm epsilon --
+with every derived value resolved by the core's own configuration helpers rather than left to the
+caller to recompute, so a dispatch cannot drift from the path the reference transcript came from.
 
 ## Ownership
 

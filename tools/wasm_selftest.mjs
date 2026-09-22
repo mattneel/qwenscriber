@@ -108,6 +108,7 @@ const required = [
     "qw_model_finish",
     "qw_model_set_cache_format",
     "qw_model_requirements",
+    "qw_model_audio_config",
     "qw_decode_begin",
     "qw_decode_step",
     "qw_decode_tokens",
@@ -342,6 +343,17 @@ equal(e.qw_detokenize(handle, 0, 0, 0, 0, 0), STATUS.invalidState, "detokenize n
 
 /** Offsets of the fields this harness reads out of a `model_config.Config` (160 bytes). */
 const CONFIG_OFFSET = {
+    audio_d_model: 16,
+    audio_layers: 20,
+    audio_attention_heads: 24,
+    audio_ffn_dim: 28,
+    audio_downsample_hidden: 32,
+    audio_n_window: 36,
+    audio_n_window_infer: 40,
+    audio_max_position_steps: 44,
+    audio_output_dim: 48,
+    audio_mel_bins: 52,
+    audio_layer_norm_eps: 56,
     text_layers: 64,
     text_key_value_heads: 72,
     text_head_dim: 76,
@@ -397,6 +409,13 @@ function buildShard(values) {
         e.qw_model_requirements(handle, requirementsPtr),
         STATUS.invalidState,
         "requirements before begin are refused",
+    );
+    const audioConfigPtr = e.qw_alloc(72, 8) >>> 0;
+    check(audioConfigPtr !== 0, "allocated the audio config buffer");
+    equal(
+        e.qw_model_audio_config(handle, audioConfigPtr),
+        STATUS.invalidState,
+        "audio config before begin is refused",
     );
     equal(
         e.qw_model_add_shard(handle, requirementsPtr, 16),
@@ -552,6 +571,17 @@ function exerciseModel(modelDir) {
         return;
     }
     const configView = new DataView(config.buffer, config.byteOffset, config.byteLength);
+    // A wasm32 instance tops out at 2 GiB of linear memory, and a configuration's own position
+    // budget can ask for more than fits at f32: 8192 positions of key/value cache need 1.88 GB on
+    // top of the weights, which `qw_model_finish` refuses with `out_of_memory`. `--max-positions`
+    // exists for the host tools for this reason; here the budget is lowered before the load rather
+    // than the checks skipped, so every expectation below reads the value the load actually used.
+    const declaredPositions = configView.getUint32(CONFIG_OFFSET.max_positions, true);
+    const positions = Math.min(declaredPositions, 2048);
+    if (positions !== declaredPositions) {
+        configView.setUint32(CONFIG_OFFSET.max_positions, positions, true);
+    }
+    console.log(`positions: ${declaredPositions} declared, ${positions} loaded`);
     const shardBuffers = manifest.shards.map((shard) => {
         const bytes = new Uint8Array(readFileSync(`${modelDir}/${shard.name}`));
         if (bytes.length !== shard.bytes) {
@@ -655,6 +685,85 @@ function exerciseModel(modelDir) {
         `scratch ${requirements.scratchBytes} B, total ${requirements.totalBytes} B ` +
         `(${(requirements.totalBytes / 2 ** 30).toFixed(3)} GiB), positions ` +
         `${requirements.maxPositions}, audio frames ${requirements.maxAudioFrames}`,
+    );
+
+    // The audio tower's geometry, which a caller dispatching the tower itself reads. Each value is
+    // checked against the configuration the manifest names, and each derived value against an
+    // independent derivation from it: a core helper that changed its mind would fail here rather
+    // than silently moving a GPU dispatch off the path the reference transcript came from.
+    const audioConfigPtr = e.qw_alloc(72, 8) >>> 0;
+    check(audioConfigPtr !== 0, "allocated the loaded-model audio config buffer");
+    equal(
+        e.qw_model_audio_config(handle, audioConfigPtr),
+        STATUS.ok,
+        "audio config for the loaded model",
+    );
+    const audioView = new DataView(e.memory.buffer, audioConfigPtr, 72);
+    const audio = {
+        dModel: audioView.getUint32(0, true),
+        layers: audioView.getUint32(4, true),
+        attentionHeads: audioView.getUint32(8, true),
+        headDim: audioView.getUint32(12, true),
+        ffnDim: audioView.getUint32(16, true),
+        downsampleHidden: audioView.getUint32(20, true),
+        nWindow: audioView.getUint32(24, true),
+        nWindowInfer: audioView.getUint32(28, true),
+        chunkFrames: audioView.getUint32(32, true),
+        frequencyBins: audioView.getUint32(36, true),
+        convOutInputFeatures: audioView.getUint32(40, true),
+        chunkSteps: audioView.getUint32(44, true),
+        maxPositionSteps: audioView.getUint32(48, true),
+        outputDim: audioView.getUint32(52, true),
+        melBins: audioView.getUint32(56, true),
+        layerNormEps: audioView.getFloat32(60, true),
+        reserved0: audioView.getUint32(64, true),
+        reserved1: audioView.getUint32(68, true),
+    };
+    const configAudio = (name) => configView.getUint32(CONFIG_OFFSET[name], true);
+    equal(audio.dModel, configAudio("audio_d_model"), "audio d_model is the configuration's");
+    equal(audio.layers, configAudio("audio_layers"), "audio layers are the configuration's");
+    equal(audio.attentionHeads, configAudio("audio_attention_heads"), "audio heads are the configuration's");
+    equal(audio.ffnDim, configAudio("audio_ffn_dim"), "audio feed-forward width is the configuration's");
+    equal(audio.downsampleHidden, configAudio("audio_downsample_hidden"), "downsample width is the configuration's");
+    equal(audio.nWindow, configAudio("audio_n_window"), "window length is the configuration's");
+    equal(audio.nWindowInfer, configAudio("audio_n_window_infer"), "inference window is the configuration's");
+    equal(audio.maxPositionSteps, configAudio("audio_max_position_steps"), "position rows are the configuration's");
+    equal(audio.outputDim, configAudio("audio_output_dim"), "projector width is the configuration's");
+    equal(audio.melBins, configAudio("audio_mel_bins"), "mel bins are the configuration's");
+    check(
+        audio.layerNormEps === configView.getFloat32(CONFIG_OFFSET.audio_layer_norm_eps, true),
+        "layer norm epsilon is the configuration's",
+        `got ${audio.layerNormEps}`,
+    );
+    equal(audio.headDim, audio.dModel / audio.attentionHeads, "head width is d_model over heads");
+    equal(audio.chunkFrames, 2 * audio.nWindow, "a chunk is two windows of mel frames");
+    equal(
+        audio.frequencyBins,
+        audio.melBins / 8,
+        "three stride-two convolutions leave an eighth of the mel bins",
+    );
+    equal(
+        audio.convOutInputFeatures,
+        audio.downsampleHidden * audio.frequencyBins,
+        "the downsample input is its width times the remaining bins",
+    );
+    // The convolution stack's own arithmetic -- stride two, padding one, a 3x3 kernel -- applied
+    // three times to the frames one chunk consumes.
+    let chunkSteps = audio.chunkFrames;
+    for (let index = 0; index < 3; index += 1) chunkSteps = Math.floor((chunkSteps - 1) / 2) + 1;
+    equal(audio.chunkSteps, chunkSteps, "chunk steps is the stack's output for one chunk");
+    equal(
+        audio.maxPositionSteps >= audio.chunkSteps,
+        true,
+        "the sinusoidal table covers a whole chunk",
+    );
+    equal(audio.reserved0, 0, "reserved_0 is written as zero");
+    equal(audio.reserved1, 0, "reserved_1 is written as zero");
+    console.log(
+        `audio tower: d_model ${audio.dModel}, ${audio.layers} layers, ${audio.attentionHeads} heads ` +
+        `x ${audio.headDim}, chunk ${audio.chunkFrames} frames -> ${audio.chunkSteps} steps, ` +
+        `${audio.frequencyBins} bins left, downsample input ${audio.convOutInputFeatures}, ` +
+        `projector ${audio.outputDim}`,
     );
 
     // The cache width is chosen before a load, and the requirements say what it costs. The exact

@@ -289,12 +289,63 @@ pub const ModelRequirements = extern struct {
     reserved: u32 = 0,
 };
 
+/// `qw_model_audio_config`: the audio tower's geometry. Written by
+/// `qw_model_audio_config`.
+///
+///     offset  0  u32  d_model                  tower width, in and out of every block
+///     offset  4  u32  layers                   encoder blocks
+///     offset  8  u32  attention_heads          heads per block
+///     offset 12  u32  head_dim                 d_model / attention_heads
+///     offset 16  u32  ffn_dim                  feed-forward width inside a block
+///     offset 20  u32  downsample_hidden_size   the convolution stack's output channels
+///     offset 24  u32  n_window                 mel frames per half-chunk
+///     offset 28  u32  n_window_infer           mel frames one attention window spans
+///     offset 32  u32  chunk_frames             mel frames one convolution chunk consumes
+///     offset 36  u32  frequency_bins           mel bins left after the convolution stack
+///     offset 40  u32  conv_out_input_features  downsample_hidden_size * frequency_bins
+///     offset 44  u32  chunk_steps              time steps the stack emits per chunk
+///     offset 48  u32  max_position_steps       rows in the sinusoidal position table
+///     offset 52  u32  output_dim               projector output width, the decoder's hidden size
+///     offset 56  u32  mel_bins                 mel bins the frontend produces
+///     offset 60  f32  layer_norm_eps           epsilon of every tower LayerNorm
+///     offset 64  u32  reserved_0, written as zero
+///     offset 68  u32  reserved_1, written as zero
+///
+/// Every derived value is resolved by the core's own configuration helpers, not
+/// left for a caller to recompute: `head_dim`, `chunk_frames`, `frequency_bins`,
+/// `conv_out_input_features`, and `chunk_steps` are the same numbers the core's
+/// forward pass uses, so a caller that dispatches the tower itself cannot drift
+/// from the path the reference transcript came out of. A caller that never asks
+/// for this sees the behavior it already had, which is why the model family grew
+/// this export in place.
+pub const AudioConfig = extern struct {
+    d_model: u32,
+    layers: u32,
+    attention_heads: u32,
+    head_dim: u32,
+    ffn_dim: u32,
+    downsample_hidden_size: u32,
+    n_window: u32,
+    n_window_infer: u32,
+    chunk_frames: u32,
+    frequency_bins: u32,
+    conv_out_input_features: u32,
+    chunk_steps: u32,
+    max_position_steps: u32,
+    output_dim: u32,
+    mel_bins: u32,
+    layer_norm_eps: f32,
+    reserved_0: u32 = 0,
+    reserved_1: u32 = 0,
+};
+
 comptime {
     // These sizes are part of the ABI; JavaScript allocates exactly them.
     std.debug.assert(@sizeOf(MelResult) == 16);
     std.debug.assert(@sizeOf(SelfTestResult) == 32);
     std.debug.assert(@sizeOf(TokenizerDescriptor) == 24);
     std.debug.assert(@sizeOf(ModelRequirements) == 48);
+    std.debug.assert(@sizeOf(AudioConfig) == 72);
     std.debug.assert(@sizeOf(Status) == 4);
 
     // Field offsets are documented above and asserted here, so a reordering is
@@ -307,6 +358,24 @@ comptime {
     std.debug.assert(@offsetOf(ModelRequirements, "max_audio_frames") == 36);
     std.debug.assert(@offsetOf(ModelRequirements, "max_decode_tokens") == 40);
     std.debug.assert(@offsetOf(ModelRequirements, "reserved") == 44);
+    std.debug.assert(@offsetOf(AudioConfig, "d_model") == 0);
+    std.debug.assert(@offsetOf(AudioConfig, "layers") == 4);
+    std.debug.assert(@offsetOf(AudioConfig, "attention_heads") == 8);
+    std.debug.assert(@offsetOf(AudioConfig, "head_dim") == 12);
+    std.debug.assert(@offsetOf(AudioConfig, "ffn_dim") == 16);
+    std.debug.assert(@offsetOf(AudioConfig, "downsample_hidden_size") == 20);
+    std.debug.assert(@offsetOf(AudioConfig, "n_window") == 24);
+    std.debug.assert(@offsetOf(AudioConfig, "n_window_infer") == 28);
+    std.debug.assert(@offsetOf(AudioConfig, "chunk_frames") == 32);
+    std.debug.assert(@offsetOf(AudioConfig, "frequency_bins") == 36);
+    std.debug.assert(@offsetOf(AudioConfig, "conv_out_input_features") == 40);
+    std.debug.assert(@offsetOf(AudioConfig, "chunk_steps") == 44);
+    std.debug.assert(@offsetOf(AudioConfig, "max_position_steps") == 48);
+    std.debug.assert(@offsetOf(AudioConfig, "output_dim") == 52);
+    std.debug.assert(@offsetOf(AudioConfig, "mel_bins") == 56);
+    std.debug.assert(@offsetOf(AudioConfig, "layer_norm_eps") == 60);
+    std.debug.assert(@offsetOf(AudioConfig, "reserved_0") == 64);
+    std.debug.assert(@offsetOf(AudioConfig, "reserved_1") == 68);
 
     // Feature bits are a mask, so every family must own exactly one bit.
     std.debug.assert(@popCount(features) == 5);

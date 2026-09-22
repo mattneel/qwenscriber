@@ -388,6 +388,19 @@ export fn qw_model_requirements(handle: u32, out_ptr: u32) i32 {
     return abi.Status.ok.code();
 }
 
+/// Writes an `abi.AudioConfig`: the audio tower's geometry.
+///
+/// The model family grows in place, as `qw_model_set_cache_format` did: a caller that never asks
+/// for the tower's geometry gets exactly the behavior it had, and no version bump is needed. The
+/// values are the core's own, resolved from the same configuration helpers its forward pass uses.
+export fn qw_model_audio_config(handle: u32, out_ptr: u32) i32 {
+    if (requireInstance(handle)) |status| return status;
+    const out = structRegion(abi.AudioConfig, out_ptr) orelse
+        return abi.Status.invalid_argument.code();
+    model.audioConfig(out) catch |err| return abi.statusFromError(err).code();
+    return abi.Status.ok.code();
+}
+
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------

@@ -262,6 +262,48 @@ pub const Model = struct {
         assert(out.reserved == 0);
     }
 
+    /// The audio tower's geometry, for a caller that dispatches the tower itself.
+    ///
+    /// Reported from the loaded configuration through the same helpers the core's forward pass
+    /// uses -- `audioHeadDim`, `audioChunkFrames`, `audioFrequencyBinsAfterConvolutions`,
+    /// `audioConvOutInputFeatures`, `audioChunkSteps` -- so a caller cannot derive a different
+    /// number than the one the reference transcript was produced with.
+    pub fn audioConfig(self: *const Model, out: *abi.AudioConfig) Error!void {
+        // A model exists exactly in the loaded and decoding states, so this is the state check as
+        // well.
+        const loaded = self.model orelse return Error.InvalidState;
+        assert(self.state == .loaded or self.state == .decoding);
+        const config = &loaded.config;
+
+        out.* = .{
+            .d_model = config.audio_d_model,
+            .layers = config.audio_layers,
+            .attention_heads = config.audio_attention_heads,
+            .head_dim = config.audioHeadDim(),
+            .ffn_dim = config.audio_ffn_dim,
+            .downsample_hidden_size = config.audio_downsample_hidden_size,
+            .n_window = config.audio_n_window,
+            .n_window_infer = config.audio_n_window_infer,
+            .chunk_frames = config.audioChunkFrames(),
+            .frequency_bins = config.audioFrequencyBinsAfterConvolutions(),
+            .conv_out_input_features = config.audioConvOutInputFeatures(),
+            .chunk_steps = config.audioChunkSteps(),
+            .max_position_steps = config.audio_max_position_steps,
+            .output_dim = config.audio_output_dim,
+            .mel_bins = config.mel_bins,
+            .layer_norm_eps = config.audio_layer_norm_eps,
+            .reserved_0 = 0,
+            .reserved_1 = 0,
+        };
+        // A caller divides the convolution stack's frames by these, so a zero would be a division
+        // by zero on the far side of the ABI rather than an error here.
+        assert(out.head_dim > 0);
+        assert(out.chunk_frames > 0);
+        assert(out.chunk_steps > 0);
+        assert(out.reserved_0 == 0);
+        assert(out.reserved_1 == 0);
+    }
+
     /// Runs the audio tower and projector over one clip's log-mel features,
     /// resets the decoder, prefills the prompt, and holds the first token.
     ///
