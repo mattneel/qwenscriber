@@ -511,6 +511,18 @@ export function layernorm_reference(x, weight, bias, rows, cols, eps) {
     return out;
 }
 
+// `out[column][row] = input[row][column]`, the layout change between the tower's convolution stack
+// and its downsample projection.
+export function transpose_reference(input, rows, cols) {
+    const out = new Float32Array(cols * rows);
+    for (let row = 0; row < rows; row += 1) {
+        for (let column = 0; column < cols; column += 1) {
+            out[column * rows + row] = input[row * cols + column];
+        }
+    }
+    return out;
+}
+
 export function fnv1a_64(byte_arrays) {
     let hash = FNV1A_64_OFFSET_BASIS;
     for (const bytes of byte_arrays) {

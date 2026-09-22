@@ -90,6 +90,8 @@ export const TOLERANCES = {
     // Both sides multiply f16 weights that decode exactly to the same f32 values, in the same
     // accumulation order, so the difference is the adapter's arithmetic alone.
     matmul_f16: { atol: 1e-3, rtol: 1e-4 },
+    // A permutation of the same values: expected bit exact.
+    transpose: { atol: 0, rtol: 0 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -258,6 +260,10 @@ function build_normalization_cases() {
         SHAPE.rope_tokens * SHAPE.rope_heads * SHAPE.head_dim,
         0x5eed_0005,
     );
+    // Deliberately not square, and not a multiple of the tile: both guards are exercised.
+    const transpose_rows = 480;
+    const transpose_cols = 13;
+    const transpose_input = ref.random_vector(transpose_rows * transpose_cols, 0x5eed_000f);
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
     const up = ref.random_vector(SHAPE.silu_count, 0x5eed_0007);
     const gelu_input = ref.random_vector(SHAPE.gelu_count, 0x5eed_0008);
@@ -388,6 +394,21 @@ function build_normalization_cases() {
             tolerance: TOLERANCES.layernorm,
             detail: `rows ${SHAPE.layernorm_rows}, cols ${SHAPE.layernorm_cols}, ` +
                 `eps ${SHAPE.layernorm_eps}`,
+        },
+        {
+            name: "transpose_f32",
+            shader: "transpose_f32.wgsl",
+            entry_point: "transpose_f32_main",
+            workgroup: [16, 16, 1],
+            bindings: [
+                { uniform: pack_uniform([transpose_rows, transpose_cols, 0, 0]) },
+                { input: transpose_input },
+                { output: transpose_rows * transpose_cols },
+            ],
+            dispatch: [ceil_div(transpose_cols, 16), ceil_div(transpose_rows, 16), 1],
+            expected: ref.transpose_reference(transpose_input, transpose_rows, transpose_cols),
+            tolerance: TOLERANCES.transpose,
+            detail: `[${transpose_rows}][${transpose_cols}] -> [${transpose_cols}][${transpose_rows}]`,
         },
         {
             name: "conv3x3_stride2_gelu",

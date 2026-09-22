@@ -20,6 +20,7 @@ export type WebGpuKernelName =
   | "matmul_q4"
   | "matmul_q5"
   | "matmul_f16"
+  | "transpose_f32"
   | "rmsnorm"
   | "rope"
   | "attention"
@@ -49,6 +50,8 @@ export interface WebGpuKernelDescriptor {
 }
 
 /** Uniform block sizes, as `abi`-style structs: four 4-byte fields, or two of them for attention. */
+// 16x16 tile plus the padding column that keeps the read side off one shared-memory bank.
+const TRANSPOSE_TILE_STORAGE_BYTES = 16 * 17 * 4;
 const PARAMS_BYTES = 16;
 const ATTENTION_PARAMS_BYTES = 32;
 
@@ -113,6 +116,18 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
       { binding: 2, kind: "storage-read", minBindingSizeBytes: 0 },
       { binding: 3, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  transpose_f32: {
+    name: "transpose_f32",
+    file: "transpose_f32.wgsl",
+    entryPoint: "transpose_f32_main",
+    workgroupSize: [16, 16, 1],
+    workgroupStorageBytes: TRANSPOSE_TILE_STORAGE_BYTES,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
     ],
   },
   rmsnorm: {
