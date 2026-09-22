@@ -286,6 +286,39 @@ function build_normalization_cases() {
     // plane four groups of 64 bytes. One group is all zeros, which must store a zero scale.
     const quantize_rows = 2;
     const quantize_cols = 128;
+    // A grouped decode attention: four query heads over two key/value heads, the model's head width,
+    // and five cached positions -- enough for a non-trivial softmax and for the head mapping to
+    // matter, and short enough that the position loop exits after one stride.
+    const decode_heads = 4;
+    const decode_kv_heads = 2;
+    const decode_head_dim = 128;
+    const decode_positions = 5;
+    const decode_row_width = decode_kv_heads * decode_head_dim;
+    const decode_groups_per_row = decode_row_width / 64;
+    const decode_planes_offset = 16;
+    const decode_query = ref.random_vector(decode_heads * decode_head_dim, 0x5eed_0016);
+    const decode_keys = ref.quantize_q8_rows_reference(
+        ref.random_vector(decode_positions * decode_row_width, 0x5eed_0017),
+        decode_positions,
+        decode_row_width,
+        decode_planes_offset,
+    );
+    const decode_values = ref.quantize_q8_rows_reference(
+        ref.random_vector(decode_positions * decode_row_width, 0x5eed_0018),
+        decode_positions,
+        decode_row_width,
+        decode_planes_offset,
+    );
+    // The kernel binds each plane separately, so the case splits the pair the reference builds. Both
+    // bases are then zero: each binding starts at its own plane.
+    const decode_scale_bytes = decode_positions * decode_groups_per_row * 2;
+    const decode_code_bytes = decode_positions * decode_row_width;
+    const decode_planes = [
+        decode_keys.subarray(0, decode_scale_bytes),
+        decode_keys.subarray(decode_planes_offset, decode_planes_offset + decode_code_bytes),
+        decode_values.subarray(0, decode_scale_bytes),
+        decode_values.subarray(decode_planes_offset, decode_planes_offset + decode_code_bytes),
+    ];
     const quantize_values = ref.random_vector(quantize_rows * quantize_cols, 0x5eed_0015);
     for (let index = 0; index < 64; index += 1) quantize_values[64 + index] = 0;
     const quantize_data_offset = 16;
@@ -457,6 +490,44 @@ function build_normalization_cases() {
             ),
             tolerance: TOLERANCES.add_bias,
             detail: `target ${bias_rows}x${bias_cols}, bias ${bias_cols}, in place`,
+        },
+        {
+            name: "decode_attention_q8",
+            shader: "decode_attention_q8.wgsl",
+            entry_point: "decode_attention_q8_main",
+            workgroup: [128, 1, 1],
+            bindings: [
+                {
+                    uniform: pack_uniform([
+                        decode_heads,
+                        decode_kv_heads,
+                        decode_head_dim,
+                        decode_positions,
+                        decode_groups_per_row,
+                        0,
+                        0,
+                        0,
+                    ]),
+                },
+                { input: decode_query },
+                { input: decode_planes[0] },
+                { input: decode_planes[1] },
+                { input: decode_planes[2] },
+                { input: decode_planes[3] },
+                { output: decode_heads * decode_head_dim },
+            ],
+            dispatch: [decode_heads, 1, 1],
+            expected: ref.decode_attention_q8_reference(decode_query, decode_keys, decode_values, {
+                heads: decode_heads,
+                kv_heads: decode_kv_heads,
+                head_dim: decode_head_dim,
+                positions: decode_positions,
+                groups_per_row: decode_groups_per_row,
+                data_offset_bytes: decode_planes_offset,
+            }),
+            tolerance: TOLERANCES.attention,
+            detail: `heads ${decode_heads}, kv ${decode_kv_heads}, head_dim ${decode_head_dim}, ` +
+                `positions ${decode_positions}`,
         },
         {
             name: "quantize_q8_group",

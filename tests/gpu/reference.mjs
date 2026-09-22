@@ -553,6 +553,57 @@ export function quantize_q8_rows_reference(values, rows, cols, data_offset_bytes
     return bytes;
 }
 
+// The decoded value at (position, column) of a q8 cache plane: `scale * (code - 128)`, with the
+// scale read from the stored f16.
+function decode_cache_at(planes, data_offset_bytes, groups_per_row, position, column) {
+    const group = position * groups_per_row + Math.floor(column / GROUP_SIZE);
+    const scale = from_f16_bits(
+        planes[group * 2] | (planes[group * 2 + 1] << 8),
+    );
+    const code = planes[data_offset_bytes + position * groups_per_row * GROUP_SIZE + column];
+    return scale * (code - 128);
+}
+
+// One query's attention over a q8 key/value cache, mirroring the shape `decode_attention_q8.wgsl`
+// serves: grouped heads, a maximum-subtracted softmax, and a weighted sum over the cached positions.
+export function decode_attention_q8_reference(query, key_planes, value_planes, shape) {
+    const { heads, kv_heads, head_dim, positions, groups_per_row, data_offset_bytes } = shape;
+    const scale = 1 / Math.sqrt(head_dim);
+    const out = new Float32Array(heads * head_dim);
+    const group_size = heads / kv_heads;
+    for (let head = 0; head < heads; head += 1) {
+        const kv_head = Math.floor(head / group_size);
+        const column_base = kv_head * head_dim;
+        const scores = new Float32Array(positions);
+        for (let position = 0; position < positions; position += 1) {
+            let accumulator = 0;
+            for (let index = 0; index < head_dim; index += 1) {
+                accumulator += query[head * head_dim + index] *
+                    decode_cache_at(key_planes, data_offset_bytes, groups_per_row, position,
+                        column_base + index);
+            }
+            scores[position] = accumulator * scale;
+        }
+        let maximum = -Infinity;
+        for (const score of scores) maximum = Math.max(maximum, score);
+        let total = 0;
+        for (let position = 0; position < positions; position += 1) {
+            scores[position] = Math.exp(scores[position] - maximum);
+            total += scores[position];
+        }
+        for (let index = 0; index < head_dim; index += 1) {
+            let accumulator = 0;
+            for (let position = 0; position < positions; position += 1) {
+                accumulator += (scores[position] / total) *
+                    decode_cache_at(value_planes, data_offset_bytes, groups_per_row, position,
+                        column_base + index);
+            }
+            out[head * head_dim + index] = accumulator;
+        }
+    }
+    return out;
+}
+
 export function fnv1a_64(byte_arrays) {
     let hash = FNV1A_64_OFFSET_BASIS;
     for (const bytes of byte_arrays) {
