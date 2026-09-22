@@ -95,6 +95,8 @@ export const TOLERANCES = {
     // One addition per element: expected bit exact.
     add: { atol: 0, rtol: 0 },
     add_bias: { atol: 0, rtol: 0 },
+    // An index, not a value: the case adapts its own comparison.
+    argmax: { atol: 0, rtol: 0 },
     // Expected bit exact: both sides read the same integers and multiply by the
     // same f16 scale. The case deliberately includes a group whose f16 scale is
     // subnormal (~1.2e-6, where the decoded weights are ~6e-7), so the bound is
@@ -273,6 +275,13 @@ function build_normalization_cases() {
     const bias_cols = 7;
     const bias_target = ref.random_vector(bias_rows * bias_cols, 0x5eed_0012);
     const bias_values = ref.random_vector(bias_cols, 0x5eed_0013);
+    // 1000 values with the maximum deliberately past the first lane and a tie: the reduction has to
+    // pick the *lowest* index of equal maxima, and the comparison to the reference's own argmax
+    // would miss that if the maximum were the first element.
+    const argmax_count = 1000;
+    const argmax_values = ref.random_vector(argmax_count, 0x5eed_0014);
+    argmax_values[777] = 4.0;
+    argmax_values[333] = 4.0;
     const add_left = ref.random_vector(SHAPE.silu_count, 0x5eed_0010);
     const add_right = ref.random_vector(SHAPE.silu_count, 0x5eed_0011);
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
@@ -441,6 +450,24 @@ function build_normalization_cases() {
             ),
             tolerance: TOLERANCES.add_bias,
             detail: `target ${bias_rows}x${bias_cols}, bias ${bias_cols}, in place`,
+        },
+        {
+            name: "argmax_f32",
+            shader: "argmax_f32.wgsl",
+            entry_point: "argmax_f32_main",
+            workgroup: [256, 1, 1],
+            bindings: [
+                { uniform: pack_uniform([argmax_count, 0, 0, 0]) },
+                { input: argmax_values },
+                { output: 1 },
+            ],
+            dispatch: [1, 1, 1],
+            output_kind: "u32",
+            // Ties go to the lowest index, so 333 wins even though 777 is reached later by the same
+            // stride and holds the same value.
+            expected: [333],
+            tolerance: TOLERANCES.argmax,
+            detail: `count ${argmax_count}, maximum at 333 and 777`,
         },
         {
             name: "transpose_f32",
@@ -837,8 +864,12 @@ export async function run_case(gpu, kernel_case, keep_values = false) {
 
     await readback.mapAsync(GPUMapMode.READ);
     // A copy out of the mapped range, so the comparison never touches memory the
-    // driver is free to invalidate on unmap.
-    const actual = new Float32Array(readback.getMappedRange().slice(0));
+    // driver is free to invalidate on unmap. An index-producing kernel declares its output as u32:
+    // reading a bit pattern as f32 would compare a denormal against an index.
+    const mapped = readback.getMappedRange().slice(0);
+    const actual = kernel_case.output_kind === "u32"
+        ? new Uint32Array(mapped)
+        : new Float32Array(mapped);
     readback.unmap();
 
     const internal_error = await gpu.device.popErrorScope();

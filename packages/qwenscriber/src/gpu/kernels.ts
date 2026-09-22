@@ -23,6 +23,7 @@ export type WebGpuKernelName =
   | "transpose_f32"
   | "add_f32"
   | "add_bias_f32"
+  | "argmax_f32"
   | "rmsnorm"
   | "rope"
   | "attention"
@@ -151,6 +152,18 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
     entryPoint: "add_bias_f32_main",
     workgroupSize: [256, 1, 1],
     workgroupStorageBytes: 0,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  argmax_f32: {
+    name: "argmax_f32",
+    file: "argmax_f32.wgsl",
+    entryPoint: "argmax_f32_main",
+    workgroupSize: [256, 1, 1],
+    workgroupStorageBytes: 256 * 4 * 2,
     bindings: [
       { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
