@@ -25,6 +25,7 @@ export type WebGpuKernelName =
   | "add_bias_f32"
   | "argmax_f32"
   | "quantize_q8_group"
+  | "gather_row"
   | "rmsnorm"
   | "rope"
   | "attention"
@@ -182,6 +183,18 @@ export const WEBGPU_KERNELS: Readonly<Record<WebGpuKernelName, WebGpuKernelDescr
       { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
       { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
       { binding: 3, kind: "storage-read-write", minBindingSizeBytes: 0 },
+    ],
+  },
+  gather_row: {
+    name: "gather_row",
+    file: "gather_row.wgsl",
+    entryPoint: "gather_row_main",
+    workgroupSize: [64, 1, 1],
+    workgroupStorageBytes: 0,
+    bindings: [
+      { binding: 0, kind: "uniform", minBindingSizeBytes: PARAMS_BYTES },
+      { binding: 1, kind: "storage-read", minBindingSizeBytes: 0 },
+      { binding: 2, kind: "storage-read-write", minBindingSizeBytes: 0 },
     ],
   },
   rmsnorm: {

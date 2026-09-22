@@ -322,6 +322,20 @@ function build_normalization_cases() {
     const quantize_values = ref.random_vector(quantize_rows * quantize_cols, 0x5eed_0015);
     for (let index = 0; index < 64; index += 1) quantize_values[64 + index] = 0;
     const quantize_data_offset = 16;
+    // One row of a quantized matrix, gathered and dequantized: the decoder's embedding lookup. The
+    // matrix is 4 rows of 128 so the row index has to matter, and the expected value is that row of
+    // the same dequantization the reference already checks against the Zig packing.
+    const gather_rows = 4;
+    const gather_cols = 128;
+    const gather_row_index = 2;
+    const gather_tensors = ["q4", "q5", "q8"].map((format) =>
+        ref.pack_tensor(
+            format,
+            gather_rows,
+            gather_cols,
+            ref.random_vector(gather_rows * gather_cols, 0x5eed_0019),
+        )
+    );
     const add_left = ref.random_vector(SHAPE.silu_count, 0x5eed_0010);
     const add_right = ref.random_vector(SHAPE.silu_count, 0x5eed_0011);
     const gate = ref.random_vector(SHAPE.silu_count, 0x5eed_0006);
@@ -529,6 +543,38 @@ function build_normalization_cases() {
             detail: `heads ${decode_heads}, kv ${decode_kv_heads}, head_dim ${decode_head_dim}, ` +
                 `positions ${decode_positions}`,
         },
+        ...["q4", "q5", "q8"].map((format, order) => {
+            const tensor = gather_tensors[order];
+            const planes = ref.plane_views(tensor, gather_rows, gather_cols);
+            const decoded = ref.dequant_reference(planes, format, gather_rows, gather_cols);
+            const row = decoded.subarray(
+                gather_row_index * gather_cols,
+                (gather_row_index + 1) * gather_cols,
+            );
+            return {
+                name: `gather_row_${format}`,
+                shader: "gather_row.wgsl",
+                entry_point: "gather_row_main",
+                workgroup: [64, 1, 1],
+                bindings: [
+                    {
+                        uniform: pack_uniform([
+                            gather_row_index,
+                            gather_cols,
+                            tensor.data_offset_bytes,
+                            ref.FORMAT_ID[format],
+                        ]),
+                    },
+                    { input: pack_words(tensor.bytes) },
+                    { output: gather_cols },
+                ],
+                dispatch: [ceil_div(gather_cols, 64), 1, 1],
+                expected: row,
+                tolerance: TOLERANCES.dequant,
+                detail: `format ${format} (id ${ref.FORMAT_ID[format]}), row ` +
+                    `${gather_row_index} of ${gather_rows}x${gather_cols}`,
+            };
+        }),
         {
             name: "quantize_q8_group",
             shader: "quantize_q8_group.wgsl",
