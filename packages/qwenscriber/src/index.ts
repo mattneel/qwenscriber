@@ -285,6 +285,7 @@ export {
   type MatmulQ4Result,
 } from "./gpu/matmul_q4.ts";
 export { shaderSourceFromBaseUrl } from "./gpu/shaders.ts";
+export { TENSOR_KIND, type TensorKind, type TensorKindName } from "./gpu/tensor_kind.ts";
 export {
   WEBGPU_KERNELS,
   bindGroupLayoutEntries,

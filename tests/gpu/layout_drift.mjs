@@ -13,6 +13,13 @@
 // regex in the Zig source, so a rewrite that keeps the constants but changes the
 // packing fails too.
 //
+// One more table lives outside Zig entirely: the container numbers its tensor
+// kinds and the ABI reports the number, so `src/core/container.zig`'s
+// `TensorKind` and the JavaScript mirror in
+// `packages/qwenscriber/src/gpu/tensor_kind.ts` are compared here, names and
+// values both. Its rule is "append new kinds, never renumber", which is exactly
+// the rule a hand-copied mirror can break without anything else noticing.
+//
 // Usage: node tests/gpu/layout_drift.mjs
 // Exit code 0 when everything agrees, 1 otherwise.
 //
@@ -25,6 +32,8 @@ import { join } from "node:path";
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const zig_quant_path = "src/core/quant.zig";
 const zig_dtype_path = "src/core/dtype.zig";
+const zig_container_path = "src/core/container.zig";
+const tensor_kind_path = "packages/qwenscriber/src/gpu/tensor_kind.ts";
 const layout_path = "gpu/shaders/quant_layout.wgsl";
 const shader_dir = "gpu/shaders";
 
@@ -334,12 +343,89 @@ function check_kernel_mirrors(layout) {
     return { mirrors, problems };
 }
 
+// The container's tensor kinds, in declaration order with implicit values resolved: `name = 1,`
+// starts a count, `name,` continues it, and an explicit value restarts it. `_` ends the exhaustive
+// list and is not a kind.
+function zig_tensor_kinds(text) {
+    const header = "pub const TensorKind = enum(u16) {";
+    if (!text.includes(header)) return null;
+    const kinds = [];
+    let next = 0;
+    for (const line of slice_body(text, header).split("\n")) {
+        const match = line.match(/^\s*([a-z][a-z0-9_]*)\s*(?:=\s*(\d+))?,?\s*$/);
+        if (match === null) continue;
+        next = match[2] === undefined ? next : Number(match[2]);
+        kinds.push({ name: match[1], value: next });
+        next += 1;
+    }
+    return kinds;
+}
+
+// `audio_conv1_weight: 1,` inside the exported table, at the indentation the file uses.
+function ts_tensor_kinds(text) {
+    const kinds = [];
+    for (const line of text.split("\n")) {
+        const match = line.match(/^\s{2}([a-z][a-z0-9_]*):\s*(\d+),\s*$/);
+        if (match !== null) kinds.push({ name: match[1], value: Number(match[2]) });
+    }
+    return kinds;
+}
+
+// A kind the container numbers but the mirror does not know is a caller looking for a tensor it
+// cannot name; a kind the mirror invents is a caller looking for a tensor that does not exist.
+function compare_tensor_kinds() {
+    const rows = [];
+    const problems = [];
+    const zig = zig_tensor_kinds(source_text(zig_container_path));
+    if (zig === null || zig.length === 0) {
+        problems.push(`tensor kinds: ${zig_container_path} no longer declares TensorKind`);
+        return { rows, problems };
+    }
+    const mirrored = ts_tensor_kinds(source_text(tensor_kind_path));
+    const by_name = new Map(mirrored.map((kind) => [kind.name, kind.value]));
+    for (const kind of zig) {
+        const value = by_name.get(kind.name);
+        if (value === undefined) {
+            problems.push(
+                `tensor kinds: ${kind.name} = ${kind.value} is not mirrored in ${tensor_kind_path}`,
+            );
+        } else if (value !== kind.value) {
+            problems.push(
+                `tensor kinds: ${kind.name} is ${kind.value} in ${zig_container_path} and ` +
+                    `${value} in ${tensor_kind_path}`,
+            );
+        }
+    }
+    const declared = new Set(zig.map((kind) => kind.name));
+    for (const kind of mirrored) {
+        if (!declared.has(kind.name)) {
+            problems.push(
+                `tensor kinds: ${tensor_kind_path} mirrors ${kind.name}, which ` +
+                    `${zig_container_path} does not declare`,
+            );
+        }
+    }
+    const first = zig[0];
+    const last = zig[zig.length - 1];
+    rows.push({
+        name: "TensorKind",
+        detail: `${zig.length} kinds, ${first.name} = ${first.value} .. ${last.name} = ${last.value}`,
+    });
+    return { rows, problems };
+}
+
 const layout = wgsl_constants(source_text(layout_path));
 const compared = compare_layout();
 const structure = check_structure(layout);
 const mirrors = check_kernel_mirrors(layout);
+const kinds = compare_tensor_kinds();
 
-const problems = [...compared.problems, ...structure.problems, ...mirrors.problems];
+const problems = [
+    ...compared.problems,
+    ...structure.problems,
+    ...mirrors.problems,
+    ...kinds.problems,
+];
 const shader_count = new Set(mirrors.mirrors.map((mirror) => mirror.file)).size;
 
 console.log(
@@ -356,6 +442,12 @@ for (const row of structure.rows) {
 console.log(
     `layout_drift: ${mirrors.mirrors.length} constant mirrors agree across ${shader_count} kernels`,
 );
+console.log(
+    `layout_drift: tensor kinds compared between ${zig_container_path} and ${tensor_kind_path}`,
+);
+for (const row of kinds.rows) {
+    console.log(`  ${row.name}: ${row.detail}`);
+}
 
 if (problems.length > 0) {
     console.error("");
